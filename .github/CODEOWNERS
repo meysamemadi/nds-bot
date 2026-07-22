@@ -1,0 +1,5 @@
+# Every file requires review from the project owner before merge.
+* @alirezakkt
+
+# The spec is especially protected — flag this clearly in review.
+/docs/NDS_SPEC.md @alirezakkt
