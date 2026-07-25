@@ -1,0 +1,3 @@
+topology:
+  # Engineering choice — NDS specification §2
+  extrema_window: 6
