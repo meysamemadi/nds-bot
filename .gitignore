@@ -1,0 +1,23 @@
+# PyCharm
+.idea/
+
+# Virtual environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Tests and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment variables
+.env
+
+# Build files
+build/
+dist/
+*.egg-info/
