@@ -1,3 +1,14 @@
 topology:
   # Engineering choice — NDS specification §2
   extrema_window: 6
+
+quality:
+  # Documented ideal value.
+  hook_ideal: 0.86
+
+  # Engineering-choice tolerance band.
+  hook_minimum: 0.25
+  hook_maximum: 0.92
+
+  # Engineering-choice maximum acceptable NSI.
+  maximum_nsi: 0.60
