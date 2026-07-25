@@ -1,10 +1,10 @@
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 
 import pytest
 
-from nds_bot.models import Node, NodeType
+from nds_bot.models import Candle, Node, NodeType
 from nds_bot.topology.candidates import build_alternating_nodes
-from nds_bot.models import Candle
 from nds_bot.topology.extrema import detect_local_extrema
 
 BASE_TIME = datetime(2026, 1, 1, tzinfo=UTC)
@@ -144,9 +144,5 @@ def test_extrema_output_can_be_normalized() -> None:
 
     assert all(
         current.node_type is not next_node.node_type
-        for current, next_node in zip(
-            normalized_nodes,
-            normalized_nodes[1:],
-            strict=False,
-        )
+        for current, next_node in pairwise(normalized_nodes)
     )

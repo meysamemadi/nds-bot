@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from itertools import pairwise
 
 
 class NodeType(str, Enum):
@@ -20,6 +21,11 @@ class NodeLabel(str, Enum):
 class TradeSide(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
+
+
+class CycleDirection(str, Enum):
+    BULL = "BULL"
+    BEAR = "BEAR"
 
 
 @dataclass(frozen=True)
@@ -59,3 +65,45 @@ class Node:
 
         if self.price <= 0:
             raise ValueError("Node price must be positive.")
+
+
+@dataclass(frozen=True)
+class NDSCycle:
+    direction: CycleDirection
+    z: Node
+    n1: Node
+    s1: Node
+    n2: Node
+    s2: Node
+    n3: Node
+
+    @property
+    def nodes(self) -> tuple[Node, Node, Node, Node, Node, Node]:
+        return (
+            self.z,
+            self.n1,
+            self.s1,
+            self.n2,
+            self.s2,
+            self.n3,
+        )
+
+    def __post_init__(self) -> None:
+        expected_labels = (
+            NodeLabel.Z,
+            NodeLabel.N1,
+            NodeLabel.S1,
+            NodeLabel.N2,
+            NodeLabel.S2,
+            NodeLabel.N3,
+        )
+
+        actual_labels = tuple(node.label for node in self.nodes)
+
+        if actual_labels != expected_labels:
+            raise ValueError("Cycle nodes must have the correct NDS labels.")
+
+        indexes = tuple(node.index for node in self.nodes)
+
+        if any(current_index >= next_index for current_index, next_index in pairwise(indexes)):
+            raise ValueError("Cycle nodes must be ordered by increasing index.")
