@@ -1,0 +1,2 @@
+generated_at_index,generated_at_time,side,reference_price,cycle_direction,z_index,n1_index,s1_index,n2_index,s2_index,n3_index,n3_price,hook_1,hook_2,nsi
+12,2026-01-01T12:00:00+00:00,SELL,1.092,BULL,1,3,5,7,9,11,1.0948,0.6454674738736952,0.5737338138691839,0.15226019001237984

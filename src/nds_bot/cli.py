@@ -8,6 +8,10 @@ from nds_bot.data.csv_loader import (
     CandleCsvError,
     load_candles_csv,
 )
+from nds_bot.data.signal_csv import (
+    SignalCsvError,
+    write_signals_csv,
+)
 from nds_bot.models import Candle, Node
 from nds_bot.pipeline import (
     CycleAnalysis,
@@ -15,7 +19,10 @@ from nds_bot.pipeline import (
     ScanResult,
     scan_candles,
 )
-from nds_bot.replay import ReplayResult, replay_candles
+from nds_bot.replay import (
+    ReplayResult,
+    replay_candles,
+)
 from nds_bot.reporting import (
     build_replay_report,
     build_scan_report,
@@ -25,6 +32,7 @@ from nds_bot.settings import (
     ConfigurationError,
     load_scan_config,
 )
+from nds_bot.signals import build_trade_signals
 
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
@@ -51,20 +59,33 @@ def build_parser() -> argparse.ArgumentParser:
         "scan",
         help="Scan a complete candle CSV file.",
     )
-
-    _add_common_arguments(scan_parser)
+    _add_input_arguments(scan_parser)
+    _add_output_format_argument(scan_parser)
 
     replay_parser = subparsers.add_parser(
         "replay",
         help=("Replay candles chronologically without look-ahead bias."),
     )
+    _add_input_arguments(replay_parser)
+    _add_output_format_argument(replay_parser)
 
-    _add_common_arguments(replay_parser)
+    signals_parser = subparsers.add_parser(
+        "signals",
+        help=("Generate BUY and SELL signals from valid replay events."),
+    )
+    _add_input_arguments(signals_parser)
+
+    signals_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path of the output signal CSV file.",
+    )
 
     return parser
 
 
-def _add_common_arguments(
+def _add_input_arguments(
     parser: argparse.ArgumentParser,
 ) -> None:
     parser.add_argument(
@@ -88,6 +109,10 @@ def _add_common_arguments(
         help=("Override the extrema window defined in the YAML configuration."),
     )
 
+
+def _add_output_format_argument(
+    parser: argparse.ArgumentParser,
+) -> None:
     parser.add_argument(
         "--format",
         dest="output_format",
@@ -107,6 +132,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.command == "replay":
         return _run_replay(arguments)
+
+    if arguments.command == "signals":
+        return _run_signals(arguments)
 
     parser.error(f"Unsupported command: {arguments.command}")
 
@@ -185,6 +213,51 @@ def _run_replay(arguments: argparse.Namespace) -> int:
             config_path=arguments.config,
             extrema_window=config.extrema_window,
         )
+
+    return EXIT_SUCCESS
+
+
+def _run_signals(
+    arguments: argparse.Namespace,
+) -> int:
+    """Generate and export signals from replay events."""
+    try:
+        config, candles = _load_inputs(arguments)
+
+        replay_result = replay_candles(
+            candles,
+            config=config,
+        )
+
+        signals = build_trade_signals(
+            candles,
+            replay_result,
+        )
+
+        output_path = write_signals_csv(
+            signals,
+            arguments.output,
+        )
+
+    except (
+        ConfigurationError,
+        CandleCsvError,
+        SignalCsvError,
+        ValueError,
+    ) as error:
+        return _report_error(error)
+
+    print("NDS signal export completed")
+    _print_input_summary(
+        candle_count=len(candles),
+        csv_path=arguments.csv,
+        config_path=arguments.config,
+        extrema_window=config.extrema_window,
+    )
+    print(f"Replay events: {len(replay_result.events)}")
+    print(f"Valid events: {len(replay_result.valid_events)}")
+    print(f"Signals: {len(signals)}")
+    print(f"Output file: {output_path}")
 
     return EXIT_SUCCESS
 
