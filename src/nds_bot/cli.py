@@ -4,6 +4,14 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
+from nds_bot.backtest.execution import (
+    ExecutionPolicy,
+    IntrabarPriority,
+)
+from nds_bot.backtest.runner import (
+    BacktestResult,
+    run_backtest,
+)
 from nds_bot.data.csv_loader import (
     CandleCsvError,
     load_candles_csv,
@@ -11,6 +19,10 @@ from nds_bot.data.csv_loader import (
 from nds_bot.data.signal_csv import (
     SignalCsvError,
     write_signals_csv,
+)
+from nds_bot.data.trade_csv import (
+    TradeCsvError,
+    write_trades_csv,
 )
 from nds_bot.models import Candle, Node
 from nds_bot.pipeline import (
@@ -73,6 +85,42 @@ def build_parser() -> argparse.ArgumentParser:
         "signals",
         help=("Generate BUY and SELL signals from valid replay events."),
     )
+
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help=("Run chronological replay, execute signals, and export completed trades."),
+    )
+
+    _add_input_arguments(backtest_parser)
+
+    backtest_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path of the output trade CSV file.",
+    )
+
+    backtest_parser.add_argument(
+        "--reward-to-risk",
+        type=float,
+        default=2.0,
+        help="Take-profit reward-to-risk ratio.",
+    )
+
+    backtest_parser.add_argument(
+        "--stop-buffer-fraction",
+        type=float,
+        default=0.0,
+        help=("Fractional Stop Loss buffer beyond N3 (default: 0)."),
+    )
+
+    backtest_parser.add_argument(
+        "--intrabar-priority",
+        choices=tuple(priority.value for priority in IntrabarPriority),
+        default=IntrabarPriority.STOP_FIRST.value,
+        help=("Resolution when Stop Loss and Take Profit are touched inside the same candle."),
+    )
+
     _add_input_arguments(signals_parser)
 
     signals_parser.add_argument(
@@ -135,6 +183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.command == "signals":
         return _run_signals(arguments)
+
+    if arguments.command == "backtest":
+        return _run_backtest(arguments)
 
     parser.error(f"Unsupported command: {arguments.command}")
 
@@ -258,6 +309,51 @@ def _run_signals(
     print(f"Valid events: {len(replay_result.valid_events)}")
     print(f"Signals: {len(signals)}")
     print(f"Output file: {output_path}")
+
+    return EXIT_SUCCESS
+
+
+def _run_backtest(
+    arguments: argparse.Namespace,
+) -> int:
+    """Run and export a complete NDS backtest."""
+    try:
+        config, candles = _load_inputs(arguments)
+
+        execution_policy = ExecutionPolicy(
+            reward_to_risk=arguments.reward_to_risk,
+            stop_buffer_fraction=(arguments.stop_buffer_fraction),
+            intrabar_priority=IntrabarPriority(arguments.intrabar_priority),
+        )
+
+        result = run_backtest(
+            candles,
+            config=config,
+            execution_policy=execution_policy,
+        )
+
+        output_path = write_trades_csv(
+            result.execution.trades,
+            arguments.output,
+        )
+
+    except (
+        ConfigurationError,
+        CandleCsvError,
+        TradeCsvError,
+        ValueError,
+    ) as error:
+        return _report_error(error)
+
+    _print_backtest_result(
+        result,
+        candle_count=len(candles),
+        csv_path=arguments.csv,
+        config_path=arguments.config,
+        output_path=output_path,
+        extrema_window=config.extrema_window,
+        execution_policy=execution_policy,
+    )
 
     return EXIT_SUCCESS
 
@@ -394,6 +490,63 @@ def _print_input_summary(
     print(f"Configuration: {config_path}")
     print(f"Extrema window: {extrema_window}")
     print(f"Candles: {candle_count}")
+
+
+def _print_backtest_result(
+    result: BacktestResult,
+    *,
+    candle_count: int,
+    csv_path: Path,
+    config_path: Path,
+    output_path: Path,
+    extrema_window: int,
+    execution_policy: ExecutionPolicy,
+) -> None:
+    """Print a human-readable backtest report."""
+    metrics = result.metrics
+    execution = result.execution
+
+    print("NDS backtest completed")
+
+    _print_input_summary(
+        candle_count=candle_count,
+        csv_path=csv_path,
+        config_path=config_path,
+        extrema_window=extrema_window,
+    )
+
+    print(f"Reward-to-risk: {execution_policy.reward_to_risk:.4f}")
+
+    print(f"Stop buffer fraction: {execution_policy.stop_buffer_fraction:.6f}")
+
+    print(f"Intrabar priority: {execution_policy.intrabar_priority.value}")
+
+    print(f"Replay events: {len(result.replay.events)}")
+    print(f"Valid events: {len(result.replay.valid_events)}")
+    print(f"Signals: {len(result.signals)}")
+    print(f"Executed trades: {metrics.trade_count}")
+
+    print(f"Unfilled signals: {len(execution.unfilled_signals)}")
+
+    print(f"Winners: {metrics.winner_count}")
+    print(f"Losers: {metrics.loser_count}")
+    print(f"Breakeven: {metrics.breakeven_count}")
+
+    print(f"Win rate: {metrics.win_rate:.2%}")
+
+    print(f"Total R: {metrics.total_r:.4f}")
+
+    print(f"Mean R: {metrics.mean_r:.4f}")
+
+    print(f"Best R: {metrics.best_r:.4f}")
+
+    print(f"Worst R: {metrics.worst_r:.4f}")
+
+    print(f"Maximum drawdown: {metrics.maximum_drawdown_r:.4f}R")
+
+    print(f"Total price PnL: {metrics.total_price_pnl:.8f}")
+
+    print(f"Output file: {output_path}")
 
 
 def _print_analysis_details(
