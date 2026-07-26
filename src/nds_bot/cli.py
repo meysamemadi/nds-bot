@@ -8,6 +8,10 @@ from nds_bot.backtest.account import (
     AccountPolicy,
     OverlapPolicy,
 )
+from nds_bot.backtest.contracts import (
+    BelowMinimumLotPolicy,
+    ContractSpecification,
+)
 from nds_bot.backtest.costs import TradingCostPolicy
 from nds_bot.backtest.execution import (
     ExecutionPolicy,
@@ -190,6 +194,43 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=("Commission fraction charged on notional for each side (default: 0)."),
+    )
+
+    backtest_parser.add_argument(
+        "--contract-size",
+        type=float,
+        default=None,
+        help=(
+            "Enable broker lot sizing with the number of underlying units represented by one lot."
+        ),
+    )
+
+    backtest_parser.add_argument(
+        "--minimum-lot",
+        type=float,
+        default=None,
+        help=("Smallest broker-accepted lot volume (default when enabled: 0.01)."),
+    )
+
+    backtest_parser.add_argument(
+        "--maximum-lot",
+        type=float,
+        default=None,
+        help=("Largest broker-accepted lot volume (default when enabled: 100)."),
+    )
+
+    backtest_parser.add_argument(
+        "--lot-step",
+        type=float,
+        default=None,
+        help=("Allowed broker lot increment (default when enabled: 0.01)."),
+    )
+
+    backtest_parser.add_argument(
+        "--below-minimum-lot-policy",
+        choices=tuple(policy.value for policy in BelowMinimumLotPolicy),
+        default=None,
+        help=("Resolution when the risk budget cannot fund one minimum lot: SKIP or RAISE."),
     )
 
     return parser
@@ -416,12 +457,15 @@ def _run_backtest(
             commission_fraction=(arguments.commission_fraction),
         )
 
+        contract_specification = _build_contract_specification(arguments)
+
         result = run_backtest(
             candles,
             config=config,
             execution_policy=execution_policy,
             account_policy=account_policy,
             cost_policy=cost_policy,
+            contract_specification=(contract_specification),
         )
 
         account_result = result.account
@@ -462,9 +506,41 @@ def _run_backtest(
         execution_policy=execution_policy,
         account_policy=account_policy,
         cost_policy=cost_policy,
+        contract_specification=(contract_specification),
     )
 
     return EXIT_SUCCESS
+
+
+def _build_contract_specification(
+    arguments: argparse.Namespace,
+) -> ContractSpecification | None:
+    """Build optional broker contract rules from CLI arguments."""
+    values = (
+        arguments.contract_size,
+        arguments.minimum_lot,
+        arguments.maximum_lot,
+        arguments.lot_step,
+        arguments.below_minimum_lot_policy,
+    )
+
+    if all(value is None for value in values):
+        return None
+
+    if arguments.contract_size is None:
+        raise ValueError("Contract size is required when broker lot sizing options are provided.")
+
+    return ContractSpecification(
+        contract_size=arguments.contract_size,
+        minimum_lot=(0.01 if arguments.minimum_lot is None else arguments.minimum_lot),
+        maximum_lot=(100.0 if arguments.maximum_lot is None else arguments.maximum_lot),
+        lot_step=(0.01 if arguments.lot_step is None else arguments.lot_step),
+        below_minimum_policy=(
+            BelowMinimumLotPolicy.SKIP
+            if arguments.below_minimum_lot_policy is None
+            else BelowMinimumLotPolicy(arguments.below_minimum_lot_policy)
+        ),
+    )
 
 
 def _resolve_equity_output_path(
@@ -645,6 +721,7 @@ def _print_backtest_result(
     execution_policy: ExecutionPolicy,
     account_policy: AccountPolicy,
     cost_policy: TradingCostPolicy,
+    contract_specification: ContractSpecification | None,
 ) -> None:
     """Print a human-readable backtest report."""
     metrics = result.metrics
@@ -678,6 +755,16 @@ def _print_backtest_result(
     print(f"Commission fraction: {cost_policy.commission_fraction:.6f}")
 
     print(f"Adverse fill fraction: {cost_policy.adverse_fill_fraction:.6f}")
+
+    if contract_specification is None:
+        print("Contract sizing: disabled")
+    else:
+        print("Contract sizing: enabled")
+        print(f"Contract size: {contract_specification.contract_size:.8f}")
+        print(f"Minimum lot: {contract_specification.minimum_lot:.8f}")
+        print(f"Maximum lot: {contract_specification.maximum_lot:.8f}")
+        print(f"Lot step: {contract_specification.lot_step:.8f}")
+        print(f"Below minimum lot policy: {contract_specification.below_minimum_policy.value}")
 
     print(f"Replay events: {len(result.replay.events)}")
 
@@ -714,6 +801,14 @@ def _print_backtest_result(
     print(f"Accepted trades: {account_metrics.accepted_trade_count}")
 
     print(f"Skipped overlapping trades: {account_metrics.skipped_overlap_count}")
+
+    print(f"Skipped minimum-lot trades: {account_metrics.skipped_minimum_lot_count}")
+
+    print(f"Total requested risk: {account_metrics.total_requested_risk:.2f}")
+
+    print(f"Total actual risk: {account_metrics.total_actual_risk:.2f}")
+
+    print(f"Mean risk utilization: {account_metrics.mean_risk_utilization:.2%}")
 
     print(f"Gross filled PnL: {account_metrics.total_gross_pnl:.2f}")
 

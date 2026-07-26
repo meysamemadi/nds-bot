@@ -37,7 +37,17 @@ SIZED_TRADE_COLUMNS = (
     "effective_stop_price",
     "balance_before",
     "risk_amount",
+    "actual_risk_amount",
+    "risk_utilization_fraction",
+    "raw_quantity",
+    "raw_lots",
+    "lots",
     "quantity",
+    "contract_size",
+    "minimum_lot",
+    "maximum_lot",
+    "lot_step",
+    "capped_at_maximum_lot",
     "gross_pnl_per_unit",
     "net_pnl_per_unit",
     "spread_slippage_cost_per_unit",
@@ -171,7 +181,28 @@ def _sized_trade_to_row(
             "effective_stop_price": (adjustment.effective_stop_price),
             "balance_before": sized_trade.balance_before,
             "risk_amount": sized_trade.risk_amount,
+            "actual_risk_amount": (sized_trade.actual_risk_amount),
+            "risk_utilization_fraction": (sized_trade.risk_utilization_fraction),
+            "raw_quantity": sized_trade.raw_quantity,
+            "raw_lots": _raw_lots(sized_trade),
+            "lots": ("" if sized_trade.lots is None else sized_trade.lots),
             "quantity": sized_trade.quantity,
+            "contract_size": (
+                "" if sized_trade.contract_size is None else sized_trade.contract_size
+            ),
+            "minimum_lot": _specification_value(
+                sized_trade,
+                "minimum_lot",
+            ),
+            "maximum_lot": _specification_value(
+                sized_trade,
+                "maximum_lot",
+            ),
+            "lot_step": _specification_value(
+                sized_trade,
+                "lot_step",
+            ),
+            "capped_at_maximum_lot": (sized_trade.capped_at_maximum_lot),
             "gross_pnl_per_unit": (adjustment.gross_pnl_per_unit),
             "net_pnl_per_unit": adjustment.net_pnl_per_unit,
             "spread_slippage_cost_per_unit": (adjustment.spread_slippage_cost_per_unit),
@@ -189,3 +220,26 @@ def _sized_trade_to_row(
     )
 
     return row
+
+
+def _raw_lots(
+    sized_trade: SizedTrade,
+) -> float | str:
+    """Return raw lots when broker contract sizing is enabled."""
+    if sized_trade.position_size is None:
+        return ""
+
+    return sized_trade.position_size.raw_lots
+
+
+def _specification_value(
+    sized_trade: SizedTrade,
+    attribute: str,
+) -> float | str:
+    """Return one contract field or an empty CSV value."""
+    if sized_trade.position_size is None:
+        return ""
+
+    specification = sized_trade.position_size.specification
+
+    return float(getattr(specification, attribute))
