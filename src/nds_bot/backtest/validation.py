@@ -26,7 +26,7 @@ from nds_bot.signals import SignalPolicy
 
 
 class BoundaryTradePolicy(str, Enum):
-    """Define how a trade crossing the split boundary is handled."""
+    """Define how a trade crossing a validation boundary is handled."""
 
     EXCLUDE = "EXCLUDE"
     ASSIGN_TO_TRAIN = "ASSIGN_TO_TRAIN"
@@ -46,7 +46,7 @@ class HoldoutValidationConfig:
 
 @dataclass(frozen=True)
 class ValidationSegment:
-    """Metrics and optional account result for one split segment."""
+    """Metrics and optional account result for one validation segment."""
 
     name: str
     start_index: int
@@ -119,14 +119,14 @@ def run_holdout_validation(
     """
     active_validation_config = validation_config or HoldoutValidationConfig()
 
-    _validate_policy_dependencies(
+    validate_validation_policy_dependencies(
         account_policy=account_policy,
         cost_policy=cost_policy,
         contract_specification=contract_specification,
         margin_policy=margin_policy,
     )
 
-    split_index = _calculate_split_index(
+    split_index = calculate_split_index(
         candle_count=len(candles),
         train_fraction=active_validation_config.train_fraction,
     )
@@ -138,13 +138,13 @@ def run_holdout_validation(
         execution_policy=execution_policy,
     )
 
-    train_trades, test_trades, boundary_trades = _partition_trades(
+    train_trades, test_trades, boundary_trades = partition_validation_trades(
         full_backtest.execution.trades,
         split_index=split_index,
         boundary_trade_policy=(active_validation_config.boundary_trade_policy),
     )
 
-    train_segment = _build_segment(
+    train_segment = build_validation_segment(
         name="TRAIN",
         start_index=0,
         end_index=split_index - 1,
@@ -155,7 +155,7 @@ def run_holdout_validation(
         margin_policy=margin_policy,
     )
 
-    test_segment = _build_segment(
+    test_segment = build_validation_segment(
         name="TEST",
         start_index=split_index,
         end_index=len(candles) - 1,
@@ -177,11 +177,12 @@ def run_holdout_validation(
     )
 
 
-def _calculate_split_index(
+def calculate_split_index(
     *,
     candle_count: int,
     train_fraction: float,
 ) -> int:
+    """Calculate a non-empty chronological holdout split index."""
     if candle_count < 2:
         raise ValueError("Holdout validation requires at least two candles.")
 
@@ -193,7 +194,7 @@ def _calculate_split_index(
     return split_index
 
 
-def _partition_trades(
+def partition_validation_trades(
     trades: Sequence[ExecutedTrade],
     *,
     split_index: int,
@@ -203,6 +204,7 @@ def _partition_trades(
     tuple[ExecutedTrade, ...],
     tuple[ExecutedTrade, ...],
 ]:
+    """Partition trades into train, test, and boundary groups."""
     train_trades: list[ExecutedTrade] = []
     test_trades: list[ExecutedTrade] = []
     boundary_trades: list[ExecutedTrade] = []
@@ -228,7 +230,7 @@ def _partition_trades(
     )
 
 
-def _build_segment(
+def build_validation_segment(
     *,
     name: str,
     start_index: int,
@@ -239,6 +241,7 @@ def _build_segment(
     contract_specification: ContractSpecification | None,
     margin_policy: MarginPolicy | None,
 ) -> ValidationSegment:
+    """Build metrics and an independent account result for one segment."""
     account_result = (
         simulate_account(
             trades,
@@ -262,13 +265,14 @@ def _build_segment(
     )
 
 
-def _validate_policy_dependencies(
+def validate_validation_policy_dependencies(
     *,
     account_policy: AccountPolicy | None,
     cost_policy: TradingCostPolicy | None,
     contract_specification: ContractSpecification | None,
     margin_policy: MarginPolicy | None,
 ) -> None:
+    """Validate dependencies shared by holdout and walk-forward runs."""
     if cost_policy is not None and account_policy is None:
         raise ValueError("Trading costs require account simulation.")
 

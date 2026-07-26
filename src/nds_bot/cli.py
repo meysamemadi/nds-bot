@@ -26,6 +26,18 @@ from nds_bot.backtest.runner import (
     BacktestResult,
     run_backtest,
 )
+from nds_bot.backtest.validation import (
+    BoundaryTradePolicy,
+    HoldoutValidationConfig,
+    HoldoutValidationResult,
+    ValidationSegment,
+    run_holdout_validation,
+)
+from nds_bot.backtest.walk_forward import (
+    WalkForwardValidationConfig,
+    WalkForwardValidationResult,
+    run_walk_forward_validation,
+)
 from nds_bot.data.csv_loader import (
     CandleCsvError,
     load_candles_csv,
@@ -41,6 +53,14 @@ from nds_bot.data.signal_csv import (
 from nds_bot.data.trade_csv import (
     TradeCsvError,
     write_sized_trades_csv,
+)
+from nds_bot.data.validation_csv import (
+    ValidationCsvError,
+    write_validation_csv,
+)
+from nds_bot.data.walk_forward_csv import (
+    WalkForwardCsvError,
+    write_walk_forward_csv,
 )
 from nds_bot.models import Candle, Node
 from nds_bot.pipeline import (
@@ -70,6 +90,11 @@ EXIT_ERROR = 1
 OUTPUT_FORMATS = (
     "text",
     "json",
+)
+
+VALIDATION_MODES = (
+    "HOLDOUT",
+    "WALK_FORWARD",
 )
 
 
@@ -265,6 +290,64 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Resolution when required margin exceeds account equity: SKIP or RAISE."),
     )
 
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help=("Run chronological holdout or walk-forward out-of-sample validation."),
+    )
+
+    _add_input_arguments(validate_parser)
+
+    validate_parser.add_argument(
+        "--mode",
+        choices=VALIDATION_MODES,
+        default="HOLDOUT",
+        help=("Validation mode: HOLDOUT or WALK_FORWARD (default: HOLDOUT)."),
+    )
+
+    validate_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path of the validation summary CSV file.",
+    )
+
+    validate_parser.add_argument(
+        "--train-fraction",
+        type=float,
+        default=0.70,
+        help=("Chronological train fraction used by HOLDOUT mode (default: 0.70)."),
+    )
+
+    validate_parser.add_argument(
+        "--boundary-trade-policy",
+        choices=tuple(policy.value for policy in BoundaryTradePolicy),
+        default=BoundaryTradePolicy.EXCLUDE.value,
+        help=("Resolution for a trade crossing a validation boundary: EXCLUDE or ASSIGN_TO_TRAIN."),
+    )
+
+    validate_parser.add_argument(
+        "--initial-train-candles",
+        type=int,
+        default=None,
+        help=("Initial expanding train-window size required by WALK_FORWARD mode."),
+    )
+
+    validate_parser.add_argument(
+        "--test-candles",
+        type=int,
+        default=None,
+        help=("Test-window size required by WALK_FORWARD mode."),
+    )
+
+    validate_parser.add_argument(
+        "--step-candles",
+        type=int,
+        default=None,
+        help=("Distance between walk-forward split points. Defaults to the test-window size."),
+    )
+
+    _add_validation_policy_arguments(validate_parser)
+
     return parser
 
 
@@ -307,6 +390,97 @@ def _add_output_format_argument(
     )
 
 
+def _add_validation_policy_arguments(
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Add execution, account, cost, contract, and margin options."""
+    parser.add_argument(
+        "--reward-to-risk",
+        type=float,
+        default=2.0,
+    )
+    parser.add_argument(
+        "--stop-buffer-fraction",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--intrabar-priority",
+        choices=tuple(priority.value for priority in IntrabarPriority),
+        default=IntrabarPriority.STOP_FIRST.value,
+    )
+    parser.add_argument(
+        "--gap-fill-mode",
+        choices=tuple(mode.value for mode in GapFillMode),
+        default=GapFillMode.OPEN_PRICE.value,
+    )
+    parser.add_argument(
+        "--initial-balance",
+        type=float,
+        default=10_000.0,
+    )
+    parser.add_argument(
+        "--risk-fraction",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--overlap-policy",
+        choices=tuple(policy.value for policy in OverlapPolicy),
+        default=OverlapPolicy.SKIP.value,
+    )
+    parser.add_argument(
+        "--spread-fraction",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--slippage-fraction",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--commission-fraction",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--contract-size",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--minimum-lot",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--maximum-lot",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--lot-step",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--below-minimum-lot-policy",
+        choices=tuple(policy.value for policy in BelowMinimumLotPolicy),
+        default=None,
+    )
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--insufficient-margin-policy",
+        choices=tuple(policy.value for policy in InsufficientMarginPolicy),
+        default=None,
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
 ) -> int:
@@ -325,6 +499,9 @@ def main(
 
     if arguments.command == "backtest":
         return _run_backtest(arguments)
+
+    if arguments.command == "validate":
+        return _run_validate(arguments)
 
     parser.error(f"Unsupported command: {arguments.command}")
 
@@ -545,6 +722,117 @@ def _run_backtest(
         contract_specification=(contract_specification),
         margin_policy=margin_policy,
     )
+
+    return EXIT_SUCCESS
+
+
+def _run_validate(
+    arguments: argparse.Namespace,
+) -> int:
+    """Run chronological holdout or walk-forward validation."""
+    try:
+        config, candles = _load_inputs(arguments)
+
+        execution_policy = ExecutionPolicy(
+            reward_to_risk=arguments.reward_to_risk,
+            stop_buffer_fraction=(arguments.stop_buffer_fraction),
+            intrabar_priority=IntrabarPriority(arguments.intrabar_priority),
+            gap_fill_mode=GapFillMode(arguments.gap_fill_mode),
+        )
+
+        account_policy = AccountPolicy(
+            initial_balance=arguments.initial_balance,
+            risk_fraction=arguments.risk_fraction,
+            overlap_policy=OverlapPolicy(arguments.overlap_policy),
+        )
+
+        cost_policy = TradingCostPolicy(
+            spread_fraction=arguments.spread_fraction,
+            slippage_fraction=arguments.slippage_fraction,
+            commission_fraction=(arguments.commission_fraction),
+        )
+
+        contract_specification = _build_contract_specification(arguments)
+        margin_policy = _build_margin_policy(arguments)
+        boundary_policy = BoundaryTradePolicy(arguments.boundary_trade_policy)
+
+        if arguments.mode == "HOLDOUT":
+            result = run_holdout_validation(
+                candles,
+                validation_config=HoldoutValidationConfig(
+                    train_fraction=arguments.train_fraction,
+                    boundary_trade_policy=boundary_policy,
+                ),
+                config=config,
+                execution_policy=execution_policy,
+                account_policy=account_policy,
+                cost_policy=cost_policy,
+                contract_specification=(contract_specification),
+                margin_policy=margin_policy,
+            )
+
+            output_path = write_validation_csv(
+                result,
+                arguments.output,
+            )
+
+        else:
+            if arguments.initial_train_candles is None:
+                raise ValueError("Initial train candles are required for WALK_FORWARD mode.")
+
+            if arguments.test_candles is None:
+                raise ValueError("Test candles are required for WALK_FORWARD mode.")
+
+            result = run_walk_forward_validation(
+                candles,
+                validation_config=(
+                    WalkForwardValidationConfig(
+                        initial_train_candles=(arguments.initial_train_candles),
+                        test_candles=arguments.test_candles,
+                        step_candles=arguments.step_candles,
+                        boundary_trade_policy=boundary_policy,
+                    )
+                ),
+                config=config,
+                execution_policy=execution_policy,
+                account_policy=account_policy,
+                cost_policy=cost_policy,
+                contract_specification=(contract_specification),
+                margin_policy=margin_policy,
+            )
+
+            output_path = write_walk_forward_csv(
+                result,
+                arguments.output,
+            )
+
+    except (
+        ConfigurationError,
+        CandleCsvError,
+        ValidationCsvError,
+        WalkForwardCsvError,
+        ValueError,
+    ) as error:
+        return _report_error(error)
+
+    if arguments.mode == "HOLDOUT":
+        _print_holdout_validation_result(
+            result,
+            candle_count=len(candles),
+            csv_path=arguments.csv,
+            config_path=arguments.config,
+            extrema_window=config.extrema_window,
+            output_path=output_path,
+        )
+    else:
+        _print_walk_forward_validation_result(
+            result,
+            candle_count=len(candles),
+            csv_path=arguments.csv,
+            config_path=arguments.config,
+            extrema_window=config.extrema_window,
+            output_path=output_path,
+        )
 
     return EXIT_SUCCESS
 
@@ -919,6 +1207,107 @@ def _print_backtest_result(
     print(f"Trade output file: {trade_output_path}")
 
     print(f"Equity output file: {equity_output_path}")
+
+
+def _print_holdout_validation_result(
+    result: HoldoutValidationResult,
+    *,
+    candle_count: int,
+    csv_path: Path,
+    config_path: Path,
+    extrema_window: int,
+    output_path: Path,
+) -> None:
+    """Print a human-readable holdout validation report."""
+    print("NDS holdout validation completed")
+    _print_input_summary(
+        candle_count=candle_count,
+        csv_path=csv_path,
+        config_path=config_path,
+        extrema_window=extrema_window,
+    )
+    print(f"Train fraction: {result.config.train_fraction:.2%}")
+    print(f"Split index: {result.split_index}")
+    print(f"Split time: {result.split_time.isoformat()}")
+    print(f"Boundary trade policy: {result.config.boundary_trade_policy.value}")
+    print(f"Boundary trades: {len(result.boundary_trades)}")
+    print(f"Excluded boundary trades: {result.excluded_boundary_trade_count}")
+    _print_validation_segment(result.train)
+    _print_validation_segment(result.test)
+    print(f"Output file: {output_path}")
+
+
+def _print_walk_forward_validation_result(
+    result: WalkForwardValidationResult,
+    *,
+    candle_count: int,
+    csv_path: Path,
+    config_path: Path,
+    extrema_window: int,
+    output_path: Path,
+) -> None:
+    """Print a human-readable walk-forward validation report."""
+    summary = result.summary
+    metrics = summary.test_metrics
+
+    print("NDS walk-forward validation completed")
+    _print_input_summary(
+        candle_count=candle_count,
+        csv_path=csv_path,
+        config_path=config_path,
+        extrema_window=extrema_window,
+    )
+    print(f"Initial train candles: {result.config.initial_train_candles}")
+    print(f"Test candles per fold: {result.config.test_candles}")
+    print(f"Step candles: {result.config.effective_step_candles}")
+    print(f"Folds: {summary.fold_count}")
+    print(f"Combined test trades: {metrics.trade_count}")
+    print(f"Combined test win rate: {metrics.win_rate:.2%}")
+    print(f"Combined test total R: {metrics.total_r:.4f}")
+    print(f"Combined test mean R: {metrics.mean_r:.4f}")
+    print(f"Combined test maximum drawdown: {metrics.maximum_drawdown_r:.4f}R")
+    print(
+        "Profitable / losing / flat folds: "
+        f"{summary.profitable_fold_count} / "
+        f"{summary.losing_fold_count} / "
+        f"{summary.flat_fold_count}"
+    )
+    print(f"Mean independent test return: {summary.mean_test_return_fraction:.2%}")
+    print(f"Total independent test net profit: {summary.total_test_net_profit:.2f}")
+    print(f"Worst independent test drawdown: {summary.worst_test_drawdown_fraction:.2%}")
+
+    for fold in result.folds:
+        print()
+        print(
+            f"Fold {fold.fold_number}: "
+            f"train 0-{fold.train.end_index}, "
+            f"test {fold.test.start_index}-{fold.test.end_index}"
+        )
+        print(
+            "Test trades / Total R / Win rate: "
+            f"{fold.test.metrics.trade_count} / "
+            f"{fold.test.metrics.total_r:.4f} / "
+            f"{fold.test.metrics.win_rate:.2%}"
+        )
+
+    print(f"Output file: {output_path}")
+
+
+def _print_validation_segment(
+    segment: ValidationSegment,
+) -> None:
+    """Print one holdout train or test segment."""
+    print()
+    print(f"{segment.name} segment: indexes {segment.start_index}-{segment.end_index}")
+    print(f"Candles: {segment.candle_count}")
+    print(f"Trades: {segment.metrics.trade_count}")
+    print(f"Win rate: {segment.metrics.win_rate:.2%}")
+    print(f"Total R: {segment.metrics.total_r:.4f}")
+    print(f"Mean R: {segment.metrics.mean_r:.4f}")
+
+    if segment.account is not None:
+        print(f"Ending balance: {segment.account.metrics.ending_balance:.2f}")
+        print(f"Account return: {segment.account.metrics.return_fraction:.2%}")
 
 
 def _print_analysis_details(
