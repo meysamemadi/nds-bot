@@ -6,6 +6,7 @@ from nds_bot.backtest.account import (
     AccountResult,
     simulate_account,
 )
+from nds_bot.backtest.costs import TradingCostPolicy
 from nds_bot.backtest.execution import (
     ExecutionPolicy,
     ExecutionResult,
@@ -46,13 +47,20 @@ def run_backtest(
     signal_policy: SignalPolicy | None = None,
     execution_policy: ExecutionPolicy | None = None,
     account_policy: AccountPolicy | None = None,
+    cost_policy: TradingCostPolicy | None = None,
 ) -> BacktestResult:
     """
-    Run replay, signal generation, execution, and metrics.
+    Run replay, signal generation, and execution.
 
     Account simulation is performed only when account_policy
     is explicitly provided.
+
+    Trading costs require account simulation because their
+    monetary effect depends on position quantity.
     """
+    if cost_policy is not None and account_policy is None:
+        raise ValueError("Trading costs require account simulation.")
+
     replay_result = replay_candles(
         candles,
         config=config,
@@ -76,6 +84,7 @@ def run_backtest(
         simulate_account(
             execution_result.trades,
             policy=account_policy,
+            cost_policy=cost_policy,
         )
         if account_policy is not None
         else None

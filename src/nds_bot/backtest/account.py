@@ -4,6 +4,11 @@ from datetime import datetime
 from enum import Enum
 from itertools import pairwise
 
+from nds_bot.backtest.costs import (
+    CostAdjustedTrade,
+    TradingCostPolicy,
+    apply_trading_costs,
+)
 from nds_bot.backtest.execution import ExecutedTrade
 
 
@@ -32,10 +37,10 @@ class AccountPolicy:
         Starting account balance in account-currency units.
 
     risk_fraction:
-        Fraction of the current balance risked on each accepted trade.
+        Fraction of current balance risked on each trade.
 
     overlap_policy:
-        Resolution rule for independently generated overlapping trades.
+        Resolution rule for overlapping trades.
     """
 
     initial_balance: float = 10_000.0
@@ -53,16 +58,23 @@ class AccountPolicy:
 @dataclass(frozen=True)
 class SizedTrade:
     """
-    One executed trade with account-aware position sizing.
+    One account-sized trade after trading costs.
 
-    Monetary values are expressed in account-currency units.
-    No commission, spread, or slippage is included yet.
+    monetary_pnl is net of spread, slippage, and commission.
     """
 
     trade: ExecutedTrade
+    cost_adjustment: CostAdjustedTrade
+
     balance_before: float
     risk_amount: float
     quantity: float
+
+    gross_monetary_pnl: float
+    spread_slippage_cost: float
+    commission_amount: float
+    total_cost_amount: float
+
     monetary_pnl: float
     balance_after: float
 
@@ -76,12 +88,28 @@ class SizedTrade:
         if self.quantity <= 0:
             raise ValueError("Trade quantity must be positive.")
 
+        if (
+            min(
+                self.spread_slippage_cost,
+                self.commission_amount,
+                self.total_cost_amount,
+            )
+            < 0
+        ):
+            raise ValueError("Trading costs cannot be negative.")
+
         if self.balance_after <= 0:
             raise ValueError("Balance after trade must be positive.")
 
     @property
     def r_multiple(self) -> float:
-        return self.trade.r_multiple
+        """Return realized net R after all costs."""
+        return self.monetary_pnl / self.risk_amount
+
+    @property
+    def gross_r_multiple(self) -> float:
+        """Return gross R before realized costs."""
+        return self.gross_monetary_pnl / self.risk_amount
 
     @property
     def is_winner(self) -> bool:
@@ -97,13 +125,13 @@ class EquityPoint:
     """
     One point on the closed-trade equity curve.
 
-    The first point represents the initial account balance and
-    therefore has no exit index or exit time.
+    The first point represents initial account balance.
     """
 
     trade_number: int
     exit_index: int | None
     exit_time: datetime | None
+
     balance: float
     peak_balance: float
     drawdown_amount: float
@@ -128,13 +156,19 @@ class EquityPoint:
 
 @dataclass(frozen=True)
 class AccountMetrics:
-    """Summary of account-level backtest performance."""
+    """Summary of account-level performance."""
 
     accepted_trade_count: int
     skipped_overlap_count: int
 
     initial_balance: float
     ending_balance: float
+
+    total_gross_pnl: float
+    total_spread_slippage_cost: float
+    total_commission: float
+    total_cost: float
+
     net_profit: float
     return_fraction: float
 
@@ -144,11 +178,14 @@ class AccountMetrics:
 
 @dataclass(frozen=True)
 class AccountResult:
-    """Complete result of account and position-size simulation."""
+    """Complete account and position-size simulation."""
 
     policy: AccountPolicy
+    cost_policy: TradingCostPolicy
+
     trades: tuple[SizedTrade, ...]
     skipped_overlapping_trades: tuple[ExecutedTrade, ...]
+
     equity_curve: tuple[EquityPoint, ...]
     metrics: AccountMetrics
 
@@ -157,14 +194,16 @@ def simulate_account(
     trades: Sequence[ExecutedTrade],
     *,
     policy: AccountPolicy | None = None,
+    cost_policy: TradingCostPolicy | None = None,
 ) -> AccountResult:
     """
-    Apply dynamic position sizing to chronologically ordered trades.
+    Apply dynamic position sizing and trading costs.
 
-    Position size is calculated from the current balance. By default,
-    overlapping trades are skipped so only one position can be open.
+    Position size is based on all-in stop risk, including
+    spread, slippage, and entry/stop commission.
     """
     active_policy = policy or AccountPolicy()
+    active_cost_policy = cost_policy or TradingCostPolicy()
 
     _validate_trade_order(trades)
 
@@ -197,22 +236,40 @@ def simulate_account(
             skipped_trades.append(trade)
             continue
 
+        cost_adjustment = apply_trading_costs(
+            trade,
+            policy=active_cost_policy,
+        )
+
         risk_amount = balance * active_policy.risk_fraction
 
-        quantity = risk_amount / trade.risk_per_unit
+        quantity = risk_amount / cost_adjustment.risk_per_unit
 
-        monetary_pnl = trade.price_pnl * quantity
+        gross_monetary_pnl = cost_adjustment.gross_pnl_per_unit * quantity
+
+        spread_slippage_cost = cost_adjustment.spread_slippage_cost_per_unit * quantity
+
+        commission_amount = cost_adjustment.total_commission_per_unit * quantity
+
+        total_cost_amount = spread_slippage_cost + commission_amount
+
+        monetary_pnl = cost_adjustment.net_pnl_per_unit * quantity
 
         balance_after = balance + monetary_pnl
 
         if balance_after <= 0:
-            raise ValueError("Trade result would reduce the account balance to zero or below.")
+            raise ValueError("Trade result would reduce account balance to zero or below.")
 
         sized_trade = SizedTrade(
             trade=trade,
+            cost_adjustment=cost_adjustment,
             balance_before=balance,
             risk_amount=risk_amount,
             quantity=quantity,
+            gross_monetary_pnl=gross_monetary_pnl,
+            spread_slippage_cost=(spread_slippage_cost),
+            commission_amount=commission_amount,
+            total_cost_amount=total_cost_amount,
             monetary_pnl=monetary_pnl,
             balance_after=balance_after,
         )
@@ -247,11 +304,23 @@ def simulate_account(
 
     maximum_drawdown_fraction = max(point.drawdown_fraction for point in equity_curve)
 
+    total_gross_pnl = sum(trade.gross_monetary_pnl for trade in sized_trades)
+
+    total_spread_slippage_cost = sum(trade.spread_slippage_cost for trade in sized_trades)
+
+    total_commission = sum(trade.commission_amount for trade in sized_trades)
+
+    total_cost = sum(trade.total_cost_amount for trade in sized_trades)
+
     metrics = AccountMetrics(
         accepted_trade_count=len(sized_trades),
         skipped_overlap_count=len(skipped_trades),
         initial_balance=active_policy.initial_balance,
         ending_balance=balance,
+        total_gross_pnl=total_gross_pnl,
+        total_spread_slippage_cost=(total_spread_slippage_cost),
+        total_commission=total_commission,
+        total_cost=total_cost,
         net_profit=(balance - active_policy.initial_balance),
         return_fraction=(balance / active_policy.initial_balance - 1),
         maximum_drawdown_amount=(maximum_drawdown_amount),
@@ -260,6 +329,7 @@ def simulate_account(
 
     return AccountResult(
         policy=active_policy,
+        cost_policy=active_cost_policy,
         trades=tuple(sized_trades),
         skipped_overlapping_trades=tuple(skipped_trades),
         equity_curve=tuple(equity_curve),
