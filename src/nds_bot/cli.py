@@ -15,6 +15,7 @@ from nds_bot.backtest.contracts import (
 from nds_bot.backtest.costs import TradingCostPolicy
 from nds_bot.backtest.execution import (
     ExecutionPolicy,
+    GapFillMode,
     IntrabarPriority,
 )
 from nds_bot.backtest.margin import (
@@ -149,6 +150,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(priority.value for priority in IntrabarPriority),
         default=IntrabarPriority.STOP_FIRST.value,
         help=("Resolution when Stop Loss and Take Profit are touched inside the same candle."),
+    )
+
+    backtest_parser.add_argument(
+        "--gap-fill-mode",
+        choices=tuple(mode.value for mode in GapFillMode),
+        default=GapFillMode.OPEN_PRICE.value,
+        help=(
+            "Fill price used when a candle opens beyond "
+            "Stop Loss or Take Profit: OPEN_PRICE or "
+            "LEVEL_PRICE (default: OPEN_PRICE)."
+        ),
     )
 
     backtest_parser.add_argument(
@@ -463,6 +475,7 @@ def _run_backtest(
             reward_to_risk=arguments.reward_to_risk,
             stop_buffer_fraction=(arguments.stop_buffer_fraction),
             intrabar_priority=IntrabarPriority(arguments.intrabar_priority),
+            gap_fill_mode=GapFillMode(arguments.gap_fill_mode),
         )
 
         account_policy = AccountPolicy(
@@ -797,6 +810,8 @@ def _print_backtest_result(
     print(f"Stop buffer fraction: {execution_policy.stop_buffer_fraction:.6f}")
 
     print(f"Intrabar priority: {execution_policy.intrabar_priority.value}")
+
+    print(f"Gap fill mode: {execution_policy.gap_fill_mode.value}")
 
     print(f"Spread fraction: {cost_policy.spread_fraction:.6f}")
 
