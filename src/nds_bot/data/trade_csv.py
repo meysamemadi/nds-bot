@@ -48,6 +48,13 @@ SIZED_TRADE_COLUMNS = (
     "maximum_lot",
     "lot_step",
     "capped_at_maximum_lot",
+    "margin_enabled",
+    "leverage",
+    "notional_value",
+    "margin_required",
+    "free_margin_after_entry",
+    "margin_utilization_fraction",
+    "margin_level_fraction",
     "gross_pnl_per_unit",
     "net_pnl_per_unit",
     "spread_slippage_cost_per_unit",
@@ -203,6 +210,31 @@ def _sized_trade_to_row(
                 "lot_step",
             ),
             "capped_at_maximum_lot": (sized_trade.capped_at_maximum_lot),
+            "margin_enabled": (sized_trade.margin_check is not None),
+            "leverage": _margin_value(
+                sized_trade,
+                "leverage",
+            ),
+            "notional_value": _margin_value(
+                sized_trade,
+                "notional_value",
+            ),
+            "margin_required": _margin_value(
+                sized_trade,
+                "margin_required",
+            ),
+            "free_margin_after_entry": _margin_value(
+                sized_trade,
+                "free_margin_after_entry",
+            ),
+            "margin_utilization_fraction": _margin_value(
+                sized_trade,
+                "margin_utilization_fraction",
+            ),
+            "margin_level_fraction": _margin_value(
+                sized_trade,
+                "margin_level_fraction",
+            ),
             "gross_pnl_per_unit": (adjustment.gross_pnl_per_unit),
             "net_pnl_per_unit": adjustment.net_pnl_per_unit,
             "spread_slippage_cost_per_unit": (adjustment.spread_slippage_cost_per_unit),
@@ -243,3 +275,19 @@ def _specification_value(
     specification = sized_trade.position_size.specification
 
     return float(getattr(specification, attribute))
+
+
+def _margin_value(
+    sized_trade: SizedTrade,
+    attribute: str,
+) -> float | str:
+    """Return one margin field or an empty CSV value."""
+    margin_check = sized_trade.margin_check
+
+    if margin_check is None:
+        return ""
+
+    if attribute == "leverage":
+        return margin_check.policy.leverage
+
+    return float(getattr(margin_check, attribute))

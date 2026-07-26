@@ -17,6 +17,10 @@ from nds_bot.backtest.execution import (
     ExecutionPolicy,
     IntrabarPriority,
 )
+from nds_bot.backtest.margin import (
+    InsufficientMarginPolicy,
+    MarginPolicy,
+)
 from nds_bot.backtest.runner import (
     BacktestResult,
     run_backtest,
@@ -231,6 +235,22 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(policy.value for policy in BelowMinimumLotPolicy),
         default=None,
         help=("Resolution when the risk budget cannot fund one minimum lot: SKIP or RAISE."),
+    )
+
+    backtest_parser.add_argument(
+        "--leverage",
+        type=float,
+        default=None,
+        help=(
+            "Enable entry-time margin checks with the specified account leverage, for example 100."
+        ),
+    )
+
+    backtest_parser.add_argument(
+        "--insufficient-margin-policy",
+        choices=tuple(policy.value for policy in InsufficientMarginPolicy),
+        default=None,
+        help=("Resolution when required margin exceeds account equity: SKIP or RAISE."),
     )
 
     return parser
@@ -459,6 +479,8 @@ def _run_backtest(
 
         contract_specification = _build_contract_specification(arguments)
 
+        margin_policy = _build_margin_policy(arguments)
+
         result = run_backtest(
             candles,
             config=config,
@@ -466,6 +488,7 @@ def _run_backtest(
             account_policy=account_policy,
             cost_policy=cost_policy,
             contract_specification=(contract_specification),
+            margin_policy=margin_policy,
         )
 
         account_result = result.account
@@ -507,6 +530,7 @@ def _run_backtest(
         account_policy=account_policy,
         cost_policy=cost_policy,
         contract_specification=(contract_specification),
+        margin_policy=margin_policy,
     )
 
     return EXIT_SUCCESS
@@ -539,6 +563,31 @@ def _build_contract_specification(
             BelowMinimumLotPolicy.SKIP
             if arguments.below_minimum_lot_policy is None
             else BelowMinimumLotPolicy(arguments.below_minimum_lot_policy)
+        ),
+    )
+
+
+def _build_margin_policy(
+    arguments: argparse.Namespace,
+) -> MarginPolicy | None:
+    """Build optional leverage and margin rules from CLI arguments."""
+    values = (
+        arguments.leverage,
+        arguments.insufficient_margin_policy,
+    )
+
+    if all(value is None for value in values):
+        return None
+
+    if arguments.leverage is None:
+        raise ValueError("Leverage is required when margin options are provided.")
+
+    return MarginPolicy(
+        leverage=arguments.leverage,
+        insufficient_margin_policy=(
+            InsufficientMarginPolicy.SKIP
+            if arguments.insufficient_margin_policy is None
+            else InsufficientMarginPolicy(arguments.insufficient_margin_policy)
         ),
     )
 
@@ -722,6 +771,7 @@ def _print_backtest_result(
     account_policy: AccountPolicy,
     cost_policy: TradingCostPolicy,
     contract_specification: ContractSpecification | None,
+    margin_policy: MarginPolicy | None,
 ) -> None:
     """Print a human-readable backtest report."""
     metrics = result.metrics
@@ -766,6 +816,13 @@ def _print_backtest_result(
         print(f"Lot step: {contract_specification.lot_step:.8f}")
         print(f"Below minimum lot policy: {contract_specification.below_minimum_policy.value}")
 
+    if margin_policy is None:
+        print("Margin checking: disabled")
+    else:
+        print("Margin checking: enabled")
+        print(f"Leverage: {margin_policy.leverage:.4f}")
+        print(f"Insufficient margin policy: {margin_policy.insufficient_margin_policy.value}")
+
     print(f"Replay events: {len(result.replay.events)}")
 
     print(f"Valid events: {len(result.replay.valid_events)}")
@@ -804,11 +861,27 @@ def _print_backtest_result(
 
     print(f"Skipped minimum-lot trades: {account_metrics.skipped_minimum_lot_count}")
 
+    print(
+        f"Skipped insufficient-margin trades: {account_metrics.skipped_insufficient_margin_count}"
+    )
+
     print(f"Total requested risk: {account_metrics.total_requested_risk:.2f}")
 
     print(f"Total actual risk: {account_metrics.total_actual_risk:.2f}")
 
     print(f"Mean risk utilization: {account_metrics.mean_risk_utilization:.2%}")
+
+    print(f"Maximum margin required: {account_metrics.maximum_margin_required:.2f}")
+
+    print(f"Maximum margin utilization: {account_metrics.maximum_margin_utilization:.2%}")
+
+    minimum_free_margin = (
+        "N/A"
+        if account_metrics.minimum_free_margin_after_entry is None
+        else f"{account_metrics.minimum_free_margin_after_entry:.2f}"
+    )
+
+    print(f"Minimum free margin after entry: {minimum_free_margin}")
 
     print(f"Gross filled PnL: {account_metrics.total_gross_pnl:.2f}")
 
