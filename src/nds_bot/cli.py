@@ -8,6 +8,7 @@ from nds_bot.backtest.account import (
     AccountPolicy,
     OverlapPolicy,
 )
+from nds_bot.backtest.costs import TradingCostPolicy
 from nds_bot.backtest.execution import (
     ExecutionPolicy,
     IntrabarPriority,
@@ -30,7 +31,7 @@ from nds_bot.data.signal_csv import (
 )
 from nds_bot.data.trade_csv import (
     TradeCsvError,
-    write_trades_csv,
+    write_sized_trades_csv,
 )
 from nds_bot.models import Candle, Node
 from nds_bot.pipeline import (
@@ -118,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         required=True,
-        help="Path of the output trade CSV file.",
+        help=("Path of the account-sized and cost-adjusted trade CSV file."),
     )
 
     backtest_parser.add_argument(
@@ -168,6 +169,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=("Path of the equity-curve CSV file. Defaults to equity.csv beside the trade output."),
+    )
+
+    backtest_parser.add_argument(
+        "--spread-fraction",
+        type=float,
+        default=0.0,
+        help=("Full bid-ask spread as a fraction of price (default: 0)."),
+    )
+
+    backtest_parser.add_argument(
+        "--slippage-fraction",
+        type=float,
+        default=0.0,
+        help=("Adverse slippage applied to each fill (default: 0)."),
+    )
+
+    backtest_parser.add_argument(
+        "--commission-fraction",
+        type=float,
+        default=0.0,
+        help=("Commission fraction charged on notional for each side (default: 0)."),
     )
 
     return parser
@@ -388,11 +410,18 @@ def _run_backtest(
             overlap_policy=OverlapPolicy(arguments.overlap_policy),
         )
 
+        cost_policy = TradingCostPolicy(
+            spread_fraction=arguments.spread_fraction,
+            slippage_fraction=arguments.slippage_fraction,
+            commission_fraction=(arguments.commission_fraction),
+        )
+
         result = run_backtest(
             candles,
             config=config,
             execution_policy=execution_policy,
             account_policy=account_policy,
+            cost_policy=cost_policy,
         )
 
         account_result = result.account
@@ -400,8 +429,8 @@ def _run_backtest(
         if account_result is None:
             raise ValueError("Account simulation result is missing.")
 
-        trade_output_path = write_trades_csv(
-            result.execution.trades,
+        trade_output_path = write_sized_trades_csv(
+            account_result.trades,
             arguments.output,
         )
 
@@ -432,6 +461,7 @@ def _run_backtest(
         extrema_window=config.extrema_window,
         execution_policy=execution_policy,
         account_policy=account_policy,
+        cost_policy=cost_policy,
     )
 
     return EXIT_SUCCESS
@@ -614,6 +644,7 @@ def _print_backtest_result(
     extrema_window: int,
     execution_policy: ExecutionPolicy,
     account_policy: AccountPolicy,
+    cost_policy: TradingCostPolicy,
 ) -> None:
     """Print a human-readable backtest report."""
     metrics = result.metrics
@@ -640,6 +671,14 @@ def _print_backtest_result(
 
     print(f"Intrabar priority: {execution_policy.intrabar_priority.value}")
 
+    print(f"Spread fraction: {cost_policy.spread_fraction:.6f}")
+
+    print(f"Slippage fraction: {cost_policy.slippage_fraction:.6f}")
+
+    print(f"Commission fraction: {cost_policy.commission_fraction:.6f}")
+
+    print(f"Adverse fill fraction: {cost_policy.adverse_fill_fraction:.6f}")
+
     print(f"Replay events: {len(result.replay.events)}")
 
     print(f"Valid events: {len(result.replay.valid_events)}")
@@ -661,7 +700,7 @@ def _print_backtest_result(
 
     print(f"Maximum drawdown: {metrics.maximum_drawdown_r:.4f}R")
 
-    print(f"Total price PnL: {metrics.total_price_pnl:.8f}")
+    print(f"Total raw price PnL: {metrics.total_price_pnl:.8f}")
 
     print()
     print("Account simulation")
@@ -675,6 +714,14 @@ def _print_backtest_result(
     print(f"Accepted trades: {account_metrics.accepted_trade_count}")
 
     print(f"Skipped overlapping trades: {account_metrics.skipped_overlap_count}")
+
+    print(f"Gross filled PnL: {account_metrics.total_gross_pnl:.2f}")
+
+    print(f"Spread/slippage cost: {account_metrics.total_spread_slippage_cost:.2f}")
+
+    print(f"Commission: {account_metrics.total_commission:.2f}")
+
+    print(f"Total trading cost: {account_metrics.total_cost:.2f}")
 
     print(f"Ending balance: {account_metrics.ending_balance:.2f}")
 

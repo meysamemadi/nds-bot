@@ -1,7 +1,8 @@
 import csv
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+from nds_bot.backtest.account import SizedTrade
 from nds_bot.backtest.execution import ExecutedTrade
 
 TRADE_COLUMNS = (
@@ -29,6 +30,30 @@ TRADE_COLUMNS = (
 )
 
 
+SIZED_TRADE_COLUMNS = (
+    *TRADE_COLUMNS,
+    "effective_entry_price",
+    "effective_exit_price",
+    "effective_stop_price",
+    "balance_before",
+    "risk_amount",
+    "quantity",
+    "gross_pnl_per_unit",
+    "net_pnl_per_unit",
+    "spread_slippage_cost_per_unit",
+    "total_commission_per_unit",
+    "total_cost_per_unit",
+    "gross_monetary_pnl",
+    "spread_slippage_cost",
+    "commission_amount",
+    "total_cost_amount",
+    "net_monetary_pnl",
+    "balance_after",
+    "net_r_multiple",
+    "net_is_winner",
+)
+
+
 class TradeCsvError(ValueError):
     """Raised when a trade CSV cannot be written."""
 
@@ -38,10 +63,40 @@ def write_trades_csv(
     path: str | Path,
 ) -> Path:
     """
-    Write executed trades to CSV.
+    Write raw executed trades to CSV.
 
     Empty input still creates a CSV containing its header.
     """
+    return _write_rows(
+        path=path,
+        fieldnames=TRADE_COLUMNS,
+        rows=(_trade_to_row(trade) for trade in trades),
+    )
+
+
+def write_sized_trades_csv(
+    trades: Sequence[SizedTrade],
+    path: str | Path,
+) -> Path:
+    """
+    Write account-sized and cost-adjusted trades to CSV.
+
+    Raw execution columns are preserved for backward compatibility,
+    while cost-adjusted and monetary fields are appended.
+    """
+    return _write_rows(
+        path=path,
+        fieldnames=SIZED_TRADE_COLUMNS,
+        rows=(_sized_trade_to_row(trade) for trade in trades),
+    )
+
+
+def _write_rows(
+    *,
+    path: str | Path,
+    fieldnames: Sequence[str],
+    rows: Iterable[dict[str, object]],
+) -> Path:
     output_path = Path(path)
 
     try:
@@ -57,13 +112,13 @@ def write_trades_csv(
         ) as csv_file:
             writer = csv.DictWriter(
                 csv_file,
-                fieldnames=TRADE_COLUMNS,
+                fieldnames=fieldnames,
             )
 
             writer.writeheader()
 
-            for trade in trades:
-                writer.writerow(_trade_to_row(trade))
+            for row in rows:
+                writer.writerow(row)
 
     except OSError as error:
         raise TradeCsvError(f"Could not write trade CSV file: {output_path}") from error
@@ -82,7 +137,7 @@ def _trade_to_row(
         "side": trade.side.value,
         "signal_index": signal.generated_at_index,
         "signal_time": signal.generated_at_time.isoformat(),
-        "cycle_direction": (signal.cycle_direction.value),
+        "cycle_direction": signal.cycle_direction.value,
         "entry_index": trade.entry_index,
         "entry_time": trade.entry_time.isoformat(),
         "entry_price": trade.entry_price,
@@ -101,3 +156,36 @@ def _trade_to_row(
         "hook_2": quality.hook_ratios.second,
         "nsi": quality.nsi.score,
     }
+
+
+def _sized_trade_to_row(
+    sized_trade: SizedTrade,
+) -> dict[str, object]:
+    row = _trade_to_row(sized_trade.trade)
+    adjustment = sized_trade.cost_adjustment
+
+    row.update(
+        {
+            "effective_entry_price": (adjustment.effective_entry_price),
+            "effective_exit_price": (adjustment.effective_exit_price),
+            "effective_stop_price": (adjustment.effective_stop_price),
+            "balance_before": sized_trade.balance_before,
+            "risk_amount": sized_trade.risk_amount,
+            "quantity": sized_trade.quantity,
+            "gross_pnl_per_unit": (adjustment.gross_pnl_per_unit),
+            "net_pnl_per_unit": adjustment.net_pnl_per_unit,
+            "spread_slippage_cost_per_unit": (adjustment.spread_slippage_cost_per_unit),
+            "total_commission_per_unit": (adjustment.total_commission_per_unit),
+            "total_cost_per_unit": (adjustment.total_cost_per_unit),
+            "gross_monetary_pnl": (sized_trade.gross_monetary_pnl),
+            "spread_slippage_cost": (sized_trade.spread_slippage_cost),
+            "commission_amount": (sized_trade.commission_amount),
+            "total_cost_amount": (sized_trade.total_cost_amount),
+            "net_monetary_pnl": sized_trade.monetary_pnl,
+            "balance_after": sized_trade.balance_after,
+            "net_r_multiple": sized_trade.r_multiple,
+            "net_is_winner": sized_trade.is_winner,
+        }
+    )
+
+    return row
