@@ -15,6 +15,14 @@ class ExitReason(str, Enum):
     END_OF_DATA = "END_OF_DATA"
 
 
+class ExitFillType(str, Enum):
+    """Describe how the final exit price was selected."""
+
+    LEVEL = "LEVEL"
+    GAP_OPEN = "GAP_OPEN"
+    END_OF_DATA_CLOSE = "END_OF_DATA_CLOSE"
+
+
 class IntrabarPriority(str, Enum):
     """
     Define which level is assumed to be hit first when both
@@ -23,6 +31,13 @@ class IntrabarPriority(str, Enum):
 
     STOP_FIRST = "STOP_FIRST"
     TAKE_PROFIT_FIRST = "TAKE_PROFIT_FIRST"
+
+
+class GapFillMode(str, Enum):
+    """Define the fill price used when a candle opens beyond a level."""
+
+    OPEN_PRICE = "OPEN_PRICE"
+    LEVEL_PRICE = "LEVEL_PRICE"
 
 
 @dataclass(frozen=True)
@@ -39,11 +54,17 @@ class ExecutionPolicy:
     intrabar_priority:
         Resolution rule when Stop Loss and Take Profit are both
         touched by one candle.
+
+    gap_fill_mode:
+        OPEN_PRICE uses the candle Open when it is already beyond
+        Stop Loss or Take Profit. LEVEL_PRICE preserves the older
+        theoretical-level behavior for comparison.
     """
 
     reward_to_risk: float = 2.0
     stop_buffer_fraction: float = 0.0
     intrabar_priority: IntrabarPriority = IntrabarPriority.STOP_FIRST
+    gap_fill_mode: GapFillMode = GapFillMode.OPEN_PRICE
 
     def __post_init__(self) -> None:
         if self.reward_to_risk <= 0:
@@ -74,6 +95,7 @@ class ExecutedTrade:
     exit_time: datetime
     exit_price: float
     exit_reason: ExitReason
+    exit_fill_type: ExitFillType = ExitFillType.LEVEL
 
     def __post_init__(self) -> None:
         if self.entry_index < 0:
@@ -141,6 +163,29 @@ class ExecutedTrade:
     @property
     def holding_candles(self) -> int:
         return self.exit_index - self.entry_index + 1
+
+    @property
+    def is_gap_exit(self) -> bool:
+        return self.exit_fill_type is ExitFillType.GAP_OPEN
+
+    @property
+    def theoretical_exit_price(self) -> float:
+        """Return the Stop/Target level associated with the exit."""
+        if self.exit_reason is ExitReason.STOP_LOSS:
+            return self.stop_loss
+
+        if self.exit_reason is ExitReason.TAKE_PROFIT:
+            return self.take_profit
+
+        return self.exit_price
+
+    @property
+    def gap_distance(self) -> float:
+        """Return absolute Open-to-level distance for a gap exit."""
+        if not self.is_gap_exit:
+            return 0.0
+
+        return abs(self.exit_price - self.theoretical_exit_price)
 
 
 @dataclass(frozen=True)
@@ -249,6 +294,7 @@ def _execute_signal(
         exit_index,
         exit_price,
         exit_reason,
+        exit_fill_type,
     ) = _find_exit(
         candles,
         side=signal.side,
@@ -256,6 +302,7 @@ def _execute_signal(
         stop_loss=stop_loss,
         take_profit=take_profit,
         intrabar_priority=policy.intrabar_priority,
+        gap_fill_mode=policy.gap_fill_mode,
     )
 
     return ExecutedTrade(
@@ -269,6 +316,7 @@ def _execute_signal(
         exit_time=candles[exit_index].time,
         exit_price=exit_price,
         exit_reason=exit_reason,
+        exit_fill_type=exit_fill_type,
     )
 
 
@@ -315,12 +363,43 @@ def _find_exit(
     stop_loss: float,
     take_profit: float,
     intrabar_priority: IntrabarPriority,
-) -> tuple[int, float, ExitReason]:
+    gap_fill_mode: GapFillMode,
+) -> tuple[
+    int,
+    float,
+    ExitReason,
+    ExitFillType,
+]:
     for index in range(
         entry_index,
         len(candles),
     ):
         candle = candles[index]
+
+        gap_exit = _detect_gap_exit(
+            candle,
+            side=side,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+
+        if gap_exit is not None:
+            exit_reason, trigger_price = gap_exit
+
+            if gap_fill_mode is GapFillMode.OPEN_PRICE:
+                return (
+                    index,
+                    candle.open,
+                    exit_reason,
+                    ExitFillType.GAP_OPEN,
+                )
+
+            return (
+                index,
+                trigger_price,
+                exit_reason,
+                ExitFillType.LEVEL,
+            )
 
         stop_hit, take_profit_hit = _detect_hits(
             candle,
@@ -335,12 +414,14 @@ def _find_exit(
                     index,
                     stop_loss,
                     ExitReason.STOP_LOSS,
+                    ExitFillType.LEVEL,
                 )
 
             return (
                 index,
                 take_profit,
                 ExitReason.TAKE_PROFIT,
+                ExitFillType.LEVEL,
             )
 
         if stop_hit:
@@ -348,6 +429,7 @@ def _find_exit(
                 index,
                 stop_loss,
                 ExitReason.STOP_LOSS,
+                ExitFillType.LEVEL,
             )
 
         if take_profit_hit:
@@ -355,6 +437,7 @@ def _find_exit(
                 index,
                 take_profit,
                 ExitReason.TAKE_PROFIT,
+                ExitFillType.LEVEL,
             )
 
     last_index = len(candles) - 1
@@ -364,7 +447,37 @@ def _find_exit(
         last_index,
         last_candle.close,
         ExitReason.END_OF_DATA,
+        ExitFillType.END_OF_DATA_CLOSE,
     )
+
+
+def _detect_gap_exit(
+    candle: Candle,
+    *,
+    side: TradeSide,
+    stop_loss: float,
+    take_profit: float,
+) -> tuple[ExitReason, float] | None:
+    """
+    Detect an Open price strictly beyond Stop Loss or Take Profit.
+
+    Equality is treated as a normal level fill rather than a gap.
+    """
+    if side is TradeSide.BUY:
+        if candle.open < stop_loss:
+            return ExitReason.STOP_LOSS, stop_loss
+
+        if candle.open > take_profit:
+            return ExitReason.TAKE_PROFIT, take_profit
+
+    else:
+        if candle.open > stop_loss:
+            return ExitReason.STOP_LOSS, stop_loss
+
+        if candle.open < take_profit:
+            return ExitReason.TAKE_PROFIT, take_profit
+
+    return None
 
 
 def _detect_hits(
