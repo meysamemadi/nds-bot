@@ -1,0 +1,2 @@
+order_id,symbol,side,status,status_reason,signal_index,signal_time,scheduled_entry_index,cycle_direction,created_index,created_time,filled_index,filled_time,closed_index,closed_time
+ORD-000001,EURUSD,SELL,CLOSED,,12,2026-01-01T12:00:00+00:00,13,BULL,12,2026-01-01T12:00:00+00:00,13,2026-01-01T13:00:00+00:00,14,2026-01-01T14:00:00+00:00

@@ -50,6 +50,12 @@ from nds_bot.data.equity_csv import (
     EquityCsvError,
     write_equity_csv,
 )
+from nds_bot.data.paper_csv import (
+    PaperCsvError,
+    write_paper_equity_csv,
+    write_paper_orders_csv,
+    write_paper_trades_csv,
+)
 from nds_bot.data.portfolio_csv import (
     PortfolioCsvError,
     write_portfolio_equity_csv,
@@ -76,6 +82,10 @@ from nds_bot.data.walk_forward_csv import (
     write_walk_forward_csv,
 )
 from nds_bot.models import Candle, Node
+from nds_bot.paper.runner import (
+    PaperTradingResult,
+    run_paper_trading,
+)
 from nds_bot.pipeline import (
     CycleAnalysis,
     ScanConfig,
@@ -392,6 +402,44 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_validation_policy_arguments(portfolio_parser)
 
+    paper_parser = subparsers.add_parser(
+        "paper",
+        help=("Replay one candle stream through an offline paper-broker adapter."),
+    )
+
+    _add_input_arguments(paper_parser)
+
+    paper_parser.add_argument(
+        "--symbol",
+        default="UNKNOWN",
+        help="Instrument symbol stored in paper-trading outputs.",
+    )
+
+    paper_parser.add_argument(
+        "--orders-output",
+        type=Path,
+        required=True,
+        help="Path of the paper-order lifecycle CSV file.",
+    )
+
+    paper_parser.add_argument(
+        "--trades-output",
+        type=Path,
+        required=True,
+        help="Path of the closed paper-trade CSV file.",
+    )
+
+    paper_parser.add_argument(
+        "--equity-output",
+        type=Path,
+        default=None,
+        help=(
+            "Path of the paper equity CSV. Defaults to paper_equity.csv beside the trade output."
+        ),
+    )
+
+    _add_validation_policy_arguments(paper_parser)
+
     return parser
 
 
@@ -549,6 +597,9 @@ def main(
 
     if arguments.command == "portfolio":
         return _run_portfolio(arguments)
+
+    if arguments.command == "paper":
+        return _run_paper(arguments)
 
     parser.error(f"Unsupported command: {arguments.command}")
 
@@ -884,6 +935,83 @@ def _run_validate(
     return EXIT_SUCCESS
 
 
+def _run_paper(
+    arguments: argparse.Namespace,
+) -> int:
+    """Run an offline chronological paper-trading session."""
+    try:
+        config, candles = _load_inputs(arguments)
+
+        execution_policy = ExecutionPolicy(
+            reward_to_risk=arguments.reward_to_risk,
+            stop_buffer_fraction=(arguments.stop_buffer_fraction),
+            intrabar_priority=IntrabarPriority(arguments.intrabar_priority),
+            gap_fill_mode=GapFillMode(arguments.gap_fill_mode),
+        )
+
+        account_policy = AccountPolicy(
+            initial_balance=arguments.initial_balance,
+            risk_fraction=arguments.risk_fraction,
+            overlap_policy=OverlapPolicy(arguments.overlap_policy),
+        )
+
+        cost_policy = TradingCostPolicy(
+            spread_fraction=arguments.spread_fraction,
+            slippage_fraction=arguments.slippage_fraction,
+            commission_fraction=(arguments.commission_fraction),
+        )
+
+        contract_specification = _build_contract_specification(arguments)
+        margin_policy = _build_margin_policy(arguments)
+
+        result = run_paper_trading(
+            candles,
+            symbol=arguments.symbol,
+            config=config,
+            execution_policy=execution_policy,
+            account_policy=account_policy,
+            cost_policy=cost_policy,
+            contract_specification=contract_specification,
+            margin_policy=margin_policy,
+        )
+
+        orders_output_path = write_paper_orders_csv(
+            result.orders,
+            arguments.orders_output,
+        )
+        trades_output_path = write_paper_trades_csv(
+            result.closed_trades,
+            arguments.trades_output,
+        )
+        equity_output_path = write_paper_equity_csv(
+            result.equity_curve,
+            _resolve_paper_equity_output_path(
+                trades_output_path=trades_output_path,
+                equity_output_path=arguments.equity_output,
+            ),
+        )
+
+    except (
+        ConfigurationError,
+        CandleCsvError,
+        PaperCsvError,
+        ValueError,
+    ) as error:
+        return _report_error(error)
+
+    _print_paper_result(
+        result,
+        csv_path=arguments.csv,
+        config_path=arguments.config,
+        extrema_window=config.extrema_window,
+        orders_output_path=orders_output_path,
+        trades_output_path=trades_output_path,
+        equity_output_path=equity_output_path,
+    )
+
+    return EXIT_SUCCESS
+
+
 def _run_portfolio(
     arguments: argparse.Namespace,
 ) -> int:
@@ -963,6 +1091,18 @@ def _resolve_portfolio_equity_output_path(
         return equity_output_path
 
     return summary_output_path.with_name("portfolio_equity.csv")
+
+
+def _resolve_paper_equity_output_path(
+    *,
+    trades_output_path: Path,
+    equity_output_path: Path | None,
+) -> Path:
+    """Resolve the paper equity CSV output path."""
+    if equity_output_path is not None:
+        return equity_output_path
+
+    return trades_output_path.with_name("paper_equity.csv")
 
 
 def _build_contract_specification(
@@ -1488,6 +1628,47 @@ def _print_portfolio_result(
             f"ending={dataset_result.ending_balance:.2f} | "
             f"return={dataset_result.return_fraction:.2%}"
         )
+
+
+def _print_paper_result(
+    result: PaperTradingResult,
+    *,
+    csv_path: Path,
+    config_path: Path,
+    extrema_window: int,
+    orders_output_path: Path,
+    trades_output_path: Path,
+    equity_output_path: Path,
+) -> None:
+    """Print a human-readable paper-trading report."""
+    metrics = result.metrics
+
+    print("NDS paper trading completed")
+    print(f"Symbol: {result.symbol}")
+    print(f"CSV file: {csv_path}")
+    print(f"Configuration: {config_path}")
+    print(f"Extrema window: {extrema_window}")
+    print(f"Candles processed: {metrics.candle_count}")
+    print(f"Signals: {len(result.signals)}")
+    print(f"Orders: {metrics.order_count}")
+    print(f"Closed orders: {metrics.closed_order_count}")
+    print(f"Rejected orders: {metrics.rejected_order_count}")
+    print(f"Cancelled orders: {metrics.cancelled_order_count}")
+    print(f"Open positions: {metrics.open_position_count}")
+    print(f"Closed trades: {metrics.closed_trade_count}")
+    print(f"Win rate: {metrics.win_rate:.2%}")
+    print(f"Initial balance: {metrics.initial_balance:.2f}")
+    print(f"Ending balance: {metrics.ending_balance:.2f}")
+    print(f"Net profit: {metrics.net_profit:.2f}")
+    print(f"Account return: {metrics.return_fraction:.2%}")
+    print(
+        "Maximum drawdown: "
+        f"{metrics.maximum_drawdown_amount:.2f} "
+        f"({metrics.maximum_drawdown_fraction:.2%})"
+    )
+    print(f"Orders output file: {orders_output_path}")
+    print(f"Trades output file: {trades_output_path}")
+    print(f"Equity output file: {equity_output_path}")
 
 
 def _print_analysis_details(
