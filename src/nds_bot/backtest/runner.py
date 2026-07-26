@@ -13,6 +13,7 @@ from nds_bot.backtest.execution import (
     ExecutionResult,
     execute_signals,
 )
+from nds_bot.backtest.margin import MarginPolicy
 from nds_bot.backtest.performance import (
     BacktestMetrics,
     calculate_backtest_metrics,
@@ -50,18 +51,22 @@ def run_backtest(
     account_policy: AccountPolicy | None = None,
     cost_policy: TradingCostPolicy | None = None,
     contract_specification: ContractSpecification | None = None,
+    margin_policy: MarginPolicy | None = None,
 ) -> BacktestResult:
     """
     Run replay, signal generation, execution, and account simulation.
 
-    Trading costs and contract constraints require account simulation
-    because their monetary effect depends on position quantity.
+    Trading costs, contract constraints, and margin rules require
+    account simulation because they depend on position quantity.
     """
     if cost_policy is not None and account_policy is None:
         raise ValueError("Trading costs require account simulation.")
 
     if contract_specification is not None and account_policy is None:
         raise ValueError("Contract specification requires account simulation.")
+
+    if margin_policy is not None and account_policy is None:
+        raise ValueError("Margin policy requires account simulation.")
 
     replay_result = replay_candles(
         candles,
@@ -88,6 +93,7 @@ def run_backtest(
             policy=account_policy,
             cost_policy=cost_policy,
             contract_specification=(contract_specification),
+            margin_policy=margin_policy,
         )
         if account_policy is not None
         else None

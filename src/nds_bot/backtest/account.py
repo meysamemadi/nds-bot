@@ -16,6 +16,12 @@ from nds_bot.backtest.costs import (
     apply_trading_costs,
 )
 from nds_bot.backtest.execution import ExecutedTrade
+from nds_bot.backtest.margin import (
+    InsufficientMarginPolicy,
+    MarginCheck,
+    MarginPolicy,
+    calculate_margin,
+)
 
 
 class OverlapPolicy(str, Enum):
@@ -74,6 +80,7 @@ class SizedTrade:
     trade: ExecutedTrade
     cost_adjustment: CostAdjustedTrade
     position_size: PositionSize | None
+    margin_check: MarginCheck | None
 
     balance_before: float
     risk_amount: float
@@ -147,6 +154,38 @@ class SizedTrade:
         return self.position_size is not None and self.position_size.capped_at_maximum
 
     @property
+    def margin_required(self) -> float | None:
+        """Return used margin, or None when margin is disabled."""
+        if self.margin_check is None:
+            return None
+
+        return self.margin_check.margin_required
+
+    @property
+    def free_margin_after_entry(self) -> float | None:
+        """Return free margin immediately after entry."""
+        if self.margin_check is None:
+            return None
+
+        return self.margin_check.free_margin_after_entry
+
+    @property
+    def margin_utilization_fraction(self) -> float | None:
+        """Return required margin divided by entry equity."""
+        if self.margin_check is None:
+            return None
+
+        return self.margin_check.margin_utilization_fraction
+
+    @property
+    def margin_level_fraction(self) -> float | None:
+        """Return entry equity divided by used margin."""
+        if self.margin_check is None:
+            return None
+
+        return self.margin_check.margin_level_fraction
+
+    @property
     def risk_utilization_fraction(self) -> float:
         """Return actual risk divided by requested risk."""
         return self.actual_risk_amount / self.risk_amount
@@ -211,6 +250,7 @@ class AccountMetrics:
     accepted_trade_count: int
     skipped_overlap_count: int
     skipped_minimum_lot_count: int
+    skipped_insufficient_margin_count: int
 
     initial_balance: float
     ending_balance: float
@@ -218,6 +258,10 @@ class AccountMetrics:
     total_requested_risk: float
     total_actual_risk: float
     mean_risk_utilization: float
+
+    maximum_margin_required: float
+    maximum_margin_utilization: float
+    minimum_free_margin_after_entry: float | None
 
     total_gross_pnl: float
     total_spread_slippage_cost: float
@@ -238,6 +282,7 @@ class AccountResult:
     policy: AccountPolicy
     cost_policy: TradingCostPolicy
     contract_specification: ContractSpecification | None
+    margin_policy: MarginPolicy | None
 
     trades: tuple[SizedTrade, ...]
     skipped_overlapping_trades: tuple[
@@ -245,6 +290,10 @@ class AccountResult:
         ...,
     ]
     skipped_minimum_lot_trades: tuple[
+        ExecutedTrade,
+        ...,
+    ]
+    skipped_insufficient_margin_trades: tuple[
         ExecutedTrade,
         ...,
     ]
@@ -259,13 +308,14 @@ def simulate_account(
     policy: AccountPolicy | None = None,
     cost_policy: TradingCostPolicy | None = None,
     contract_specification: ContractSpecification | None = None,
+    margin_policy: MarginPolicy | None = None,
 ) -> AccountResult:
     """
-    Apply dynamic risk sizing, trading costs, and broker volume rules.
+    Apply dynamic risk sizing, costs, broker volume, and margin rules.
 
     Without contract_specification, exact mathematical quantity is
-    preserved for backward compatibility. With a specification,
-    quantity is converted to lots and rounded down to lot_step.
+    preserved for backward compatibility. Margin checks are performed
+    only when margin_policy is explicitly supplied.
     """
     active_policy = policy or AccountPolicy()
     active_cost_policy = cost_policy or TradingCostPolicy()
@@ -279,6 +329,7 @@ def simulate_account(
     sized_trades: list[SizedTrade] = []
     skipped_overlap_trades: list[ExecutedTrade] = []
     skipped_minimum_lot_trades: list[ExecutedTrade] = []
+    skipped_margin_trades: list[ExecutedTrade] = []
 
     equity_curve: list[EquityPoint] = [
         EquityPoint(
@@ -326,6 +377,25 @@ def simulate_account(
             quantity = position_size.quantity
             actual_risk_amount = position_size.actual_risk_amount
 
+        margin_check = _calculate_optional_margin_check(
+            equity=balance,
+            quantity=quantity,
+            entry_price=(cost_adjustment.effective_entry_price),
+            margin_policy=margin_policy,
+        )
+
+        if margin_check is not None and not margin_check.is_sufficient:
+            if (
+                margin_policy is not None
+                and margin_policy.insufficient_margin_policy is InsufficientMarginPolicy.RAISE
+            ):
+                raise ValueError(
+                    f"Insufficient margin for trade at entry index {trade.entry_index}."
+                )
+
+            skipped_margin_trades.append(trade)
+            continue
+
         gross_monetary_pnl = cost_adjustment.gross_pnl_per_unit * quantity
 
         spread_slippage_cost = cost_adjustment.spread_slippage_cost_per_unit * quantity
@@ -345,6 +415,7 @@ def simulate_account(
             trade=trade,
             cost_adjustment=cost_adjustment,
             position_size=position_size,
+            margin_check=margin_check,
             balance_before=balance,
             risk_amount=risk_amount,
             actual_risk_amount=actual_risk_amount,
@@ -402,6 +473,7 @@ def simulate_account(
         accepted_trade_count=len(sized_trades),
         skipped_overlap_count=len(skipped_overlap_trades),
         skipped_minimum_lot_count=len(skipped_minimum_lot_trades),
+        skipped_insufficient_margin_count=len(skipped_margin_trades),
         initial_balance=active_policy.initial_balance,
         ending_balance=balance,
         total_requested_risk=total_requested_risk,
@@ -411,6 +483,15 @@ def simulate_account(
             if sized_trades
             else 0.0
         ),
+        maximum_margin_required=max(
+            (trade.margin_required or 0.0 for trade in sized_trades),
+            default=0.0,
+        ),
+        maximum_margin_utilization=max(
+            (trade.margin_utilization_fraction or 0.0 for trade in sized_trades),
+            default=0.0,
+        ),
+        minimum_free_margin_after_entry=_minimum_free_margin(sized_trades),
         total_gross_pnl=total_gross_pnl,
         total_spread_slippage_cost=(total_spread_slippage_cost),
         total_commission=total_commission,
@@ -425,12 +506,47 @@ def simulate_account(
         policy=active_policy,
         cost_policy=active_cost_policy,
         contract_specification=contract_specification,
+        margin_policy=margin_policy,
         trades=tuple(sized_trades),
         skipped_overlapping_trades=tuple(skipped_overlap_trades),
         skipped_minimum_lot_trades=tuple(skipped_minimum_lot_trades),
+        skipped_insufficient_margin_trades=tuple(skipped_margin_trades),
         equity_curve=tuple(equity_curve),
         metrics=metrics,
     )
+
+
+def _calculate_optional_margin_check(
+    *,
+    equity: float,
+    quantity: float,
+    entry_price: float,
+    margin_policy: MarginPolicy | None,
+) -> MarginCheck | None:
+    if margin_policy is None:
+        return None
+
+    return calculate_margin(
+        equity=equity,
+        quantity=quantity,
+        entry_price=entry_price,
+        policy=margin_policy,
+    )
+
+
+def _minimum_free_margin(
+    trades: Sequence[SizedTrade],
+) -> float | None:
+    values = tuple(
+        trade.free_margin_after_entry
+        for trade in trades
+        if trade.free_margin_after_entry is not None
+    )
+
+    if not values:
+        return None
+
+    return min(values)
 
 
 def _calculate_optional_position_size(
