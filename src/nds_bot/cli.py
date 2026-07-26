@@ -22,6 +22,10 @@ from nds_bot.backtest.margin import (
     InsufficientMarginPolicy,
     MarginPolicy,
 )
+from nds_bot.backtest.portfolio import (
+    PortfolioResult,
+    run_portfolio_backtest,
+)
 from nds_bot.backtest.runner import (
     BacktestResult,
     run_backtest,
@@ -45,6 +49,15 @@ from nds_bot.data.csv_loader import (
 from nds_bot.data.equity_csv import (
     EquityCsvError,
     write_equity_csv,
+)
+from nds_bot.data.portfolio_csv import (
+    PortfolioCsvError,
+    write_portfolio_equity_csv,
+    write_portfolio_summary_csv,
+)
+from nds_bot.data.portfolio_manifest import (
+    PortfolioManifestError,
+    load_portfolio_datasets,
 )
 from nds_bot.data.signal_csv import (
     SignalCsvError,
@@ -348,6 +361,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_validation_policy_arguments(validate_parser)
 
+    portfolio_parser = subparsers.add_parser(
+        "portfolio",
+        help=("Run independently allocated multi-symbol and multi-timeframe portfolio backtests."),
+    )
+
+    portfolio_parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="Path of the portfolio dataset manifest CSV.",
+    )
+
+    portfolio_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path of the portfolio summary CSV file.",
+    )
+
+    portfolio_parser.add_argument(
+        "--equity-output",
+        type=Path,
+        default=None,
+        help=(
+            "Path of the combined portfolio equity CSV. "
+            "Defaults to portfolio_equity.csv beside the summary."
+        ),
+    )
+
+    _add_validation_policy_arguments(portfolio_parser)
+
     return parser
 
 
@@ -502,6 +546,9 @@ def main(
 
     if arguments.command == "validate":
         return _run_validate(arguments)
+
+    if arguments.command == "portfolio":
+        return _run_portfolio(arguments)
 
     parser.error(f"Unsupported command: {arguments.command}")
 
@@ -835,6 +882,87 @@ def _run_validate(
         )
 
     return EXIT_SUCCESS
+
+
+def _run_portfolio(
+    arguments: argparse.Namespace,
+) -> int:
+    """Run a multi-symbol and multi-timeframe portfolio backtest."""
+    try:
+        datasets = load_portfolio_datasets(arguments.manifest)
+
+        execution_policy = ExecutionPolicy(
+            reward_to_risk=arguments.reward_to_risk,
+            stop_buffer_fraction=(arguments.stop_buffer_fraction),
+            intrabar_priority=IntrabarPriority(arguments.intrabar_priority),
+            gap_fill_mode=GapFillMode(arguments.gap_fill_mode),
+        )
+
+        account_policy = AccountPolicy(
+            initial_balance=arguments.initial_balance,
+            risk_fraction=arguments.risk_fraction,
+            overlap_policy=OverlapPolicy(arguments.overlap_policy),
+        )
+
+        cost_policy = TradingCostPolicy(
+            spread_fraction=arguments.spread_fraction,
+            slippage_fraction=arguments.slippage_fraction,
+            commission_fraction=(arguments.commission_fraction),
+        )
+
+        contract_specification = _build_contract_specification(arguments)
+        margin_policy = _build_margin_policy(arguments)
+
+        result = run_portfolio_backtest(
+            datasets,
+            account_policy=account_policy,
+            execution_policy=execution_policy,
+            cost_policy=cost_policy,
+            contract_specification=contract_specification,
+            margin_policy=margin_policy,
+        )
+
+        summary_output_path = write_portfolio_summary_csv(
+            result,
+            arguments.output,
+        )
+        equity_output_path = write_portfolio_equity_csv(
+            result,
+            _resolve_portfolio_equity_output_path(
+                summary_output_path=summary_output_path,
+                equity_output_path=arguments.equity_output,
+            ),
+        )
+
+    except (
+        PortfolioManifestError,
+        ConfigurationError,
+        CandleCsvError,
+        PortfolioCsvError,
+        ValueError,
+    ) as error:
+        return _report_error(error)
+
+    _print_portfolio_result(
+        result,
+        manifest_path=arguments.manifest,
+        summary_output_path=summary_output_path,
+        equity_output_path=equity_output_path,
+    )
+
+    return EXIT_SUCCESS
+
+
+def _resolve_portfolio_equity_output_path(
+    *,
+    summary_output_path: Path,
+    equity_output_path: Path | None,
+) -> Path:
+    """Resolve the combined portfolio equity output path."""
+    if equity_output_path is not None:
+        return equity_output_path
+
+    return summary_output_path.with_name("portfolio_equity.csv")
 
 
 def _build_contract_specification(
@@ -1308,6 +1436,58 @@ def _print_validation_segment(
     if segment.account is not None:
         print(f"Ending balance: {segment.account.metrics.ending_balance:.2f}")
         print(f"Account return: {segment.account.metrics.return_fraction:.2%}")
+
+
+def _print_portfolio_result(
+    result: PortfolioResult,
+    *,
+    manifest_path: Path,
+    summary_output_path: Path,
+    equity_output_path: Path,
+) -> None:
+    """Print a human-readable portfolio report."""
+    metrics = result.metrics
+
+    print("NDS portfolio backtest completed")
+    print(f"Manifest: {manifest_path}")
+    print(f"Datasets: {metrics.dataset_count}")
+    print(f"Total candles: {metrics.total_candle_count}")
+    print(f"Total signals: {metrics.total_signal_count}")
+    print(f"Executed trades: {metrics.total_executed_trade_count}")
+    print(f"Accepted trades: {metrics.total_accepted_trade_count}")
+    print(f"Skipped overlapping trades: {metrics.total_skipped_overlap_count}")
+    print(f"Skipped minimum-lot trades: {metrics.total_skipped_minimum_lot_count}")
+    print(f"Skipped insufficient-margin trades: {metrics.total_skipped_margin_count}")
+    print(f"Profitable datasets: {metrics.profitable_dataset_count}")
+    print(f"Losing datasets: {metrics.losing_dataset_count}")
+    print(f"Flat datasets: {metrics.flat_dataset_count}")
+    print(f"Initial balance: {metrics.initial_balance:.2f}")
+    print(f"Ending balance: {metrics.ending_balance:.2f}")
+    print(f"Net profit: {metrics.net_profit:.2f}")
+    print(f"Portfolio return: {metrics.return_fraction:.2%}")
+    print(f"Mean dataset return: {metrics.mean_dataset_return_fraction:.2%}")
+    print(f"Total trading cost: {metrics.total_cost:.2f}")
+    print(
+        "Maximum portfolio drawdown: "
+        f"{metrics.maximum_drawdown_amount:.2f} "
+        f"({metrics.maximum_drawdown_fraction:.2%})"
+    )
+    print(f"Summary output file: {summary_output_path}")
+    print(f"Equity output file: {equity_output_path}")
+
+    print()
+    print("Dataset allocation")
+
+    for dataset_result in result.datasets:
+        dataset = dataset_result.dataset
+        print(
+            f"{dataset.dataset_id}: "
+            f"{dataset.symbol} {dataset.timeframe} | "
+            f"weight={dataset_result.normalized_weight:.2%} | "
+            f"allocated={dataset_result.allocated_balance:.2f} | "
+            f"ending={dataset_result.ending_balance:.2f} | "
+            f"return={dataset_result.return_fraction:.2%}"
+        )
 
 
 def _print_analysis_details(
