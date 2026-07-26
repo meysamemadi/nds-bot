@@ -1,6 +1,11 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from nds_bot.backtest.account import (
+    AccountPolicy,
+    AccountResult,
+    simulate_account,
+)
 from nds_bot.backtest.execution import (
     ExecutionPolicy,
     ExecutionResult,
@@ -31,6 +36,7 @@ class BacktestResult:
     signals: tuple[TradeSignal, ...]
     execution: ExecutionResult
     metrics: BacktestMetrics
+    account: AccountResult | None = None
 
 
 def run_backtest(
@@ -39,9 +45,13 @@ def run_backtest(
     config: ScanConfig | None = None,
     signal_policy: SignalPolicy | None = None,
     execution_policy: ExecutionPolicy | None = None,
+    account_policy: AccountPolicy | None = None,
 ) -> BacktestResult:
     """
     Run replay, signal generation, execution, and metrics.
+
+    Account simulation is performed only when account_policy
+    is explicitly provided.
     """
     replay_result = replay_candles(
         candles,
@@ -62,9 +72,19 @@ def run_backtest(
 
     metrics = calculate_backtest_metrics(execution_result.trades)
 
+    account_result = (
+        simulate_account(
+            execution_result.trades,
+            policy=account_policy,
+        )
+        if account_policy is not None
+        else None
+    )
+
     return BacktestResult(
         replay=replay_result,
         signals=signals,
         execution=execution_result,
         metrics=metrics,
+        account=account_result,
     )
