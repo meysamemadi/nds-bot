@@ -4,6 +4,10 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
+from nds_bot.backtest.account import (
+    AccountPolicy,
+    OverlapPolicy,
+)
 from nds_bot.backtest.execution import (
     ExecutionPolicy,
     IntrabarPriority,
@@ -15,6 +19,10 @@ from nds_bot.backtest.runner import (
 from nds_bot.data.csv_loader import (
     CandleCsvError,
     load_candles_csv,
+)
+from nds_bot.data.equity_csv import (
+    EquityCsvError,
+    write_equity_csv,
 )
 from nds_bot.data.signal_csv import (
     SignalCsvError,
@@ -59,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the NDS command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog="nds-bot",
-        description=("Detect and evaluate NDS cycles in candle CSV data."),
+        description=("Detect, evaluate, replay, and backtest NDS cycles in candle CSV data."),
     )
 
     subparsers = parser.add_subparsers(
@@ -71,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         "scan",
         help="Scan a complete candle CSV file.",
     )
+
     _add_input_arguments(scan_parser)
     _add_output_format_argument(scan_parser)
 
@@ -78,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
         "replay",
         help=("Replay candles chronologically without look-ahead bias."),
     )
+
     _add_input_arguments(replay_parser)
     _add_output_format_argument(replay_parser)
 
@@ -86,9 +96,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Generate BUY and SELL signals from valid replay events."),
     )
 
+    _add_input_arguments(signals_parser)
+
+    signals_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path of the output signal CSV file.",
+    )
+
     backtest_parser = subparsers.add_parser(
         "backtest",
-        help=("Run chronological replay, execute signals, and export completed trades."),
+        help=(
+            "Run chronological replay, execute signals, simulate an account, and export results."
+        ),
     )
 
     _add_input_arguments(backtest_parser)
@@ -104,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--reward-to-risk",
         type=float,
         default=2.0,
-        help="Take-profit reward-to-risk ratio.",
+        help=("Take-profit reward-to-risk ratio (default: 2.0)."),
     )
 
     backtest_parser.add_argument(
@@ -121,13 +142,32 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Resolution when Stop Loss and Take Profit are touched inside the same candle."),
     )
 
-    _add_input_arguments(signals_parser)
+    backtest_parser.add_argument(
+        "--initial-balance",
+        type=float,
+        default=10_000.0,
+        help=("Starting account balance (default: 10000)."),
+    )
 
-    signals_parser.add_argument(
-        "--output",
+    backtest_parser.add_argument(
+        "--risk-fraction",
+        type=float,
+        default=0.01,
+        help=("Fraction of current balance risked per trade (default: 0.01)."),
+    )
+
+    backtest_parser.add_argument(
+        "--overlap-policy",
+        choices=tuple(policy.value for policy in OverlapPolicy),
+        default=OverlapPolicy.SKIP.value,
+        help=("Resolution for overlapping trades: SKIP or RAISE."),
+    )
+
+    backtest_parser.add_argument(
+        "--equity-output",
         type=Path,
-        required=True,
-        help="Path of the output signal CSV file.",
+        default=None,
+        help=("Path of the equity-curve CSV file. Defaults to equity.csv beside the trade output."),
     )
 
     return parser
@@ -136,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_input_arguments(
     parser: argparse.ArgumentParser,
 ) -> None:
+    """Add common candle and configuration arguments."""
     parser.add_argument(
         "--csv",
         type=Path,
@@ -161,6 +202,7 @@ def _add_input_arguments(
 def _add_output_format_argument(
     parser: argparse.ArgumentParser,
 ) -> None:
+    """Add the text or JSON output-format argument."""
     parser.add_argument(
         "--format",
         dest="output_format",
@@ -170,7 +212,9 @@ def _add_output_format_argument(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+) -> int:
     """Run the NDS command-line interface."""
     parser = build_parser()
     arguments = parser.parse_args(argv)
@@ -192,7 +236,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     return EXIT_ERROR
 
 
-def _run_scan(arguments: argparse.Namespace) -> int:
+def _run_scan(
+    arguments: argparse.Namespace,
+) -> int:
     """Execute a complete batch scan."""
     try:
         config, candles = _load_inputs(arguments)
@@ -201,6 +247,7 @@ def _run_scan(arguments: argparse.Namespace) -> int:
             candles,
             config=config,
         )
+
     except (
         ConfigurationError,
         CandleCsvError,
@@ -218,6 +265,7 @@ def _run_scan(arguments: argparse.Namespace) -> int:
         )
 
         print(render_json(report))
+
     else:
         _print_scan_result(
             result,
@@ -230,7 +278,9 @@ def _run_scan(arguments: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
-def _run_replay(arguments: argparse.Namespace) -> int:
+def _run_replay(
+    arguments: argparse.Namespace,
+) -> int:
     """Execute a chronological candle replay."""
     try:
         config, candles = _load_inputs(arguments)
@@ -239,6 +289,7 @@ def _run_replay(arguments: argparse.Namespace) -> int:
             candles,
             config=config,
         )
+
     except (
         ConfigurationError,
         CandleCsvError,
@@ -256,6 +307,7 @@ def _run_replay(arguments: argparse.Namespace) -> int:
         )
 
         print(render_json(report))
+
     else:
         _print_replay_result(
             result,
@@ -299,14 +351,18 @@ def _run_signals(
         return _report_error(error)
 
     print("NDS signal export completed")
+
     _print_input_summary(
         candle_count=len(candles),
         csv_path=arguments.csv,
         config_path=arguments.config,
         extrema_window=config.extrema_window,
     )
+
     print(f"Replay events: {len(replay_result.events)}")
+
     print(f"Valid events: {len(replay_result.valid_events)}")
+
     print(f"Signals: {len(signals)}")
     print(f"Output file: {output_path}")
 
@@ -326,21 +382,42 @@ def _run_backtest(
             intrabar_priority=IntrabarPriority(arguments.intrabar_priority),
         )
 
+        account_policy = AccountPolicy(
+            initial_balance=arguments.initial_balance,
+            risk_fraction=arguments.risk_fraction,
+            overlap_policy=OverlapPolicy(arguments.overlap_policy),
+        )
+
         result = run_backtest(
             candles,
             config=config,
             execution_policy=execution_policy,
+            account_policy=account_policy,
         )
 
-        output_path = write_trades_csv(
+        account_result = result.account
+
+        if account_result is None:
+            raise ValueError("Account simulation result is missing.")
+
+        trade_output_path = write_trades_csv(
             result.execution.trades,
             arguments.output,
+        )
+
+        equity_output_path = write_equity_csv(
+            account_result.equity_curve,
+            _resolve_equity_output_path(
+                trade_output_path=trade_output_path,
+                equity_output_path=(arguments.equity_output),
+            ),
         )
 
     except (
         ConfigurationError,
         CandleCsvError,
         TradeCsvError,
+        EquityCsvError,
         ValueError,
     ) as error:
         return _report_error(error)
@@ -350,17 +427,37 @@ def _run_backtest(
         candle_count=len(candles),
         csv_path=arguments.csv,
         config_path=arguments.config,
-        output_path=output_path,
+        trade_output_path=trade_output_path,
+        equity_output_path=equity_output_path,
         extrema_window=config.extrema_window,
         execution_policy=execution_policy,
+        account_policy=account_policy,
     )
 
     return EXIT_SUCCESS
 
 
+def _resolve_equity_output_path(
+    *,
+    trade_output_path: Path,
+    equity_output_path: Path | None,
+) -> Path:
+    """
+    Resolve the equity CSV output path.
+
+    When no explicit path is supplied, equity.csv is placed
+    beside the trade CSV file.
+    """
+    if equity_output_path is not None:
+        return equity_output_path
+
+    return trade_output_path.with_name("equity.csv")
+
+
 def _load_inputs(
     arguments: argparse.Namespace,
 ) -> tuple[ScanConfig, list[Candle]]:
+    """Load configuration and candle data."""
     config = load_scan_config(arguments.config)
 
     config = _apply_scan_overrides(
@@ -388,7 +485,10 @@ def _apply_scan_overrides(
     )
 
 
-def _report_error(error: Exception) -> int:
+def _report_error(
+    error: Exception,
+) -> int:
+    """Write a command error to stderr."""
     print(
         f"Error: {error}",
         file=sys.stderr,
@@ -407,6 +507,7 @@ def _print_scan_result(
 ) -> None:
     """Print a human-readable batch scan report."""
     print("NDS scan completed")
+
     _print_input_summary(
         candle_count=candle_count,
         csv_path=csv_path,
@@ -415,9 +516,13 @@ def _print_scan_result(
     )
 
     print(f"Raw nodes: {len(result.raw_nodes)}")
+
     print(f"Alternating nodes: {len(result.alternating_nodes)}")
+
     print(f"Cycles: {len(result.cycles)}")
+
     print(f"Valid cycles: {len(result.valid_analyses)}")
+
     print(f"Rejected cycles: {len(result.rejected_analyses)}")
 
     if not result.analyses:
@@ -432,6 +537,7 @@ def _print_scan_result(
         status = "VALID" if analysis.is_valid else "REJECTED"
 
         print()
+
         print(f"Cycle {number}: {analysis.cycle.direction.value} | {status}")
 
         _print_analysis_details(analysis)
@@ -447,6 +553,7 @@ def _print_replay_result(
 ) -> None:
     """Print a human-readable chronological replay report."""
     print("NDS replay completed")
+
     _print_input_summary(
         candle_count=candle_count,
         csv_path=csv_path,
@@ -455,7 +562,9 @@ def _print_replay_result(
     )
 
     print(f"Events: {len(result.events)}")
+
     print(f"Valid events: {len(result.valid_events)}")
+
     print(f"Rejected events: {len(result.rejected_events)}")
 
     if not result.events:
@@ -470,6 +579,7 @@ def _print_replay_result(
         status = "VALID" if event.is_valid else "REJECTED"
 
         print()
+
         print(f"Event {number}: {event.analysis.cycle.direction.value} | {status}")
 
         print(f"Confirmed at index: {event.confirmed_at_index}")
@@ -486,6 +596,7 @@ def _print_input_summary(
     config_path: Path,
     extrema_window: int,
 ) -> None:
+    """Print shared candle-input information."""
     print(f"CSV file: {csv_path}")
     print(f"Configuration: {config_path}")
     print(f"Extrema window: {extrema_window}")
@@ -498,13 +609,21 @@ def _print_backtest_result(
     candle_count: int,
     csv_path: Path,
     config_path: Path,
-    output_path: Path,
+    trade_output_path: Path,
+    equity_output_path: Path,
     extrema_window: int,
     execution_policy: ExecutionPolicy,
+    account_policy: AccountPolicy,
 ) -> None:
     """Print a human-readable backtest report."""
     metrics = result.metrics
     execution = result.execution
+    account = result.account
+
+    if account is None:
+        raise ValueError("Account simulation result is missing.")
+
+    account_metrics = account.metrics
 
     print("NDS backtest completed")
 
@@ -522,8 +641,11 @@ def _print_backtest_result(
     print(f"Intrabar priority: {execution_policy.intrabar_priority.value}")
 
     print(f"Replay events: {len(result.replay.events)}")
+
     print(f"Valid events: {len(result.replay.valid_events)}")
+
     print(f"Signals: {len(result.signals)}")
+
     print(f"Executed trades: {metrics.trade_count}")
 
     print(f"Unfilled signals: {len(execution.unfilled_signals)}")
@@ -531,27 +653,48 @@ def _print_backtest_result(
     print(f"Winners: {metrics.winner_count}")
     print(f"Losers: {metrics.loser_count}")
     print(f"Breakeven: {metrics.breakeven_count}")
-
     print(f"Win rate: {metrics.win_rate:.2%}")
-
     print(f"Total R: {metrics.total_r:.4f}")
-
     print(f"Mean R: {metrics.mean_r:.4f}")
-
     print(f"Best R: {metrics.best_r:.4f}")
-
     print(f"Worst R: {metrics.worst_r:.4f}")
 
     print(f"Maximum drawdown: {metrics.maximum_drawdown_r:.4f}R")
 
     print(f"Total price PnL: {metrics.total_price_pnl:.8f}")
 
-    print(f"Output file: {output_path}")
+    print()
+    print("Account simulation")
+
+    print(f"Initial balance: {account_metrics.initial_balance:.2f}")
+
+    print(f"Risk fraction: {account_policy.risk_fraction:.2%}")
+
+    print(f"Overlap policy: {account_policy.overlap_policy.value}")
+
+    print(f"Accepted trades: {account_metrics.accepted_trade_count}")
+
+    print(f"Skipped overlapping trades: {account_metrics.skipped_overlap_count}")
+
+    print(f"Ending balance: {account_metrics.ending_balance:.2f}")
+
+    print(f"Net profit: {account_metrics.net_profit:.2f}")
+
+    print(f"Account return: {account_metrics.return_fraction:.2%}")
+
+    print(f"Maximum monetary drawdown: {account_metrics.maximum_drawdown_amount:.2f}")
+
+    print(f"Maximum percentage drawdown: {account_metrics.maximum_drawdown_fraction:.2%}")
+
+    print(f"Trade output file: {trade_output_path}")
+
+    print(f"Equity output file: {equity_output_path}")
 
 
 def _print_analysis_details(
     analysis: CycleAnalysis,
 ) -> None:
+    """Print nodes, legs, and quality of one cycle."""
     node_summary = " -> ".join(_format_node(node) for node in analysis.cycle.nodes)
 
     print(f"Nodes: {node_summary}")
@@ -580,7 +723,9 @@ def _print_analysis_details(
         print("Rejection reasons: " + ", ".join(analysis.rejection_reasons))
 
 
-def _format_node(node: Node) -> str:
+def _format_node(
+    node: Node,
+) -> str:
     """Format one labeled NDS cycle node."""
     label_text = node.label.value if node.label is not None else "UNKNOWN"
 
