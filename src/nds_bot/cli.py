@@ -1,4 +1,6 @@
 import argparse
+import json
+import logging
 import sys
 from collections.abc import Sequence
 from dataclasses import replace
@@ -82,6 +84,17 @@ from nds_bot.data.walk_forward_csv import (
     write_walk_forward_csv,
 )
 from nds_bot.models import Candle, Node
+from nds_bot.observability.health import (
+    HealthReport,
+    HealthStatus,
+    run_health_checks,
+)
+from nds_bot.observability.logging import (
+    LOG_FORMATS,
+    LOG_LEVELS,
+    LoggingConfig,
+    configure_logging,
+)
 from nds_bot.paper.runner import (
     PaperTradingResult,
     run_paper_trading,
@@ -110,6 +123,8 @@ from nds_bot.signals import build_trade_signals
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 
+LOGGER = logging.getLogger(__name__)
+
 OUTPUT_FORMATS = (
     "text",
     "json",
@@ -126,6 +141,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nds-bot",
         description=("Detect, evaluate, replay, and backtest NDS cycles in candle CSV data."),
+    )
+
+    parser.add_argument(
+        "--log-level",
+        choices=LOG_LEVELS,
+        default="WARNING",
+        help=("Runtime log level. Place this option before the subcommand (default: WARNING)."),
+    )
+
+    parser.add_argument(
+        "--log-format",
+        choices=LOG_FORMATS,
+        default="text",
+        help=("Runtime log format: text or json (default: text)."),
+    )
+
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional UTF-8 runtime log file.",
     )
 
     subparsers = parser.add_subparsers(
@@ -440,6 +476,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_validation_policy_arguments(paper_parser)
 
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help=(
+            "Check Python, package metadata, configuration, "
+            "candle data, and output-directory health."
+        ),
+    )
+
+    doctor_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/default.yaml"),
+        help=("Configuration file to validate (default: config/default.yaml)."),
+    )
+
+    doctor_parser.add_argument(
+        "--csv",
+        type=Path,
+        default=None,
+        help="Optional candle CSV to validate.",
+    )
+
+    doctor_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results"),
+        help=("Directory whose write access should be checked (default: results)."),
+    )
+
+    doctor_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=OUTPUT_FORMATS,
+        default="text",
+        help="Doctor report format: text or json.",
+    )
+
+    doctor_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=("Return a non-zero exit code for warnings as well as failures."),
+    )
+
     return parser
 
 
@@ -580,6 +659,22 @@ def main(
     parser = build_parser()
     arguments = parser.parse_args(argv)
 
+    try:
+        configure_logging(
+            LoggingConfig(
+                level=arguments.log_level,
+                output_format=arguments.log_format,
+                file_path=arguments.log_file,
+            )
+        )
+    except (OSError, ValueError) as error:
+        return _report_error(error)
+
+    LOGGER.debug(
+        "CLI command started",
+        extra={"command": arguments.command},
+    )
+
     if arguments.command == "scan":
         return _run_scan(arguments)
 
@@ -601,9 +696,62 @@ def main(
     if arguments.command == "paper":
         return _run_paper(arguments)
 
+    if arguments.command == "doctor":
+        return _run_doctor(arguments)
+
     parser.error(f"Unsupported command: {arguments.command}")
 
     return EXIT_ERROR
+
+
+def _run_doctor(
+    arguments: argparse.Namespace,
+) -> int:
+    """Run deterministic runtime diagnostics."""
+    report = run_health_checks(
+        config_path=arguments.config,
+        csv_path=arguments.csv,
+        output_dir=arguments.output_dir,
+    )
+
+    if arguments.output_format == "json":
+        print(
+            json.dumps(
+                report.to_dict(),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        _print_health_report(report)
+
+    if report.overall_status is HealthStatus.FAIL:
+        return EXIT_ERROR
+
+    if arguments.strict and report.overall_status is HealthStatus.WARN:
+        return EXIT_ERROR
+
+    return EXIT_SUCCESS
+
+
+def _print_health_report(
+    report: HealthReport,
+) -> None:
+    """Print a human-readable doctor report."""
+    print("NDS runtime health report")
+    print(f"Overall status: {report.overall_status.value}")
+    print(f"Generated at: {report.generated_at.isoformat()}")
+    print(f"Python: {report.python_version}")
+    print(f"Platform: {report.platform}")
+    print(f"Package version: {report.package_version or 'unavailable'}")
+
+    for check in report.checks:
+        print()
+        print(f"[{check.status.value}] {check.name}: {check.message}")
+
+        for key, value in check.details.items():
+            print(f"  {key}: {value}")
 
 
 def _run_scan(

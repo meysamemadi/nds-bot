@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -29,6 +30,8 @@ from nds_bot.signals import (
     TradeSignal,
     build_trade_signals,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,14 @@ def run_paper_trading(
     active_execution_policy = execution_policy or ExecutionPolicy()
     active_account_policy = account_policy or AccountPolicy()
 
+    LOGGER.info(
+        "Paper session started",
+        extra={
+            "symbol": symbol,
+            "candle_count": len(candle_tuple),
+        },
+    )
+
     broker = broker_adapter or PaperBroker(
         account_policy=active_account_policy,
         cost_policy=cost_policy,
@@ -138,6 +149,17 @@ def run_paper_trading(
             order_id_by_signal[key] = order.order_id
             signal_by_key[key] = signal
 
+            LOGGER.info(
+                "Paper order submitted",
+                extra={
+                    "symbol": symbol,
+                    "order_id": order.order_id,
+                    "side": signal.side.value,
+                    "signal_index": signal.generated_at_index,
+                    "scheduled_entry_index": (order.scheduled_entry_index),
+                },
+            )
+
         execution_result = execute_signals(
             prefix,
             signals,
@@ -159,10 +181,22 @@ def run_paper_trading(
             if raw_trade is None:
                 continue
 
-            broker.open_position(
+            position = broker.open_position(
                 order_id=order.order_id,
                 raw_trade=raw_trade,
             )
+
+            if position is not None:
+                LOGGER.info(
+                    "Paper position opened",
+                    extra={
+                        "symbol": symbol,
+                        "order_id": order.order_id,
+                        "position_id": position.position_id,
+                        "entry_index": position.entry_index,
+                        "quantity": position.quantity,
+                    },
+                )
 
         for position in broker.open_positions:
             raw_trade = raw_trade_by_signal.get(_signal_key(position.signal))
@@ -173,9 +207,20 @@ def run_paper_trading(
             if raw_trade.exit_reason is ExitReason.END_OF_DATA:
                 continue
 
-            broker.close_position(
+            closed_trade = broker.close_position(
                 position_id=position.position_id,
                 raw_trade=raw_trade,
+            )
+
+            LOGGER.info(
+                "Paper position closed",
+                extra={
+                    "symbol": symbol,
+                    "position_id": position.position_id,
+                    "exit_index": closed_trade.raw_trade.exit_index,
+                    "exit_reason": (closed_trade.raw_trade.exit_reason.value),
+                    "net_monetary_pnl": (closed_trade.net_monetary_pnl),
+                },
             )
 
     broker.cancel_pending_orders()
@@ -188,6 +233,17 @@ def run_paper_trading(
         equity_curve=broker.equity_curve,
         initial_balance=broker.initial_balance,
         ending_balance=broker.balance,
+    )
+
+    LOGGER.info(
+        "Paper session completed",
+        extra={
+            "symbol": symbol,
+            "order_count": metrics.order_count,
+            "closed_trade_count": metrics.closed_trade_count,
+            "open_position_count": metrics.open_position_count,
+            "ending_balance": metrics.ending_balance,
+        },
     )
 
     return PaperTradingResult(
